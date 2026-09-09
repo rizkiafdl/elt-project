@@ -61,9 +61,22 @@ jobs:
           cache-dependency-glob: dbt/requirements.txt
 
       - name: Install dbt-core and the adapters
-        # Installed from the pinned requirements.txt, never re-resolved, so a CI
-        # run a month from now installs exactly what was verified today.
-        run: uv pip install --system -r requirements.txt
+        # Installed into a venv, from the pinned requirements.txt, never
+        # re-resolved — a CI run a month from now installs exactly what was
+        # verified today.
+        #
+        # NOT `uv pip install --system`. The runner's system interpreter is
+        # externally managed (PEP 668) and uv refuses it outright:
+        #   error: The interpreter at /usr is externally managed
+        # A venv is also what the README tells a human to do and what the
+        # dbt-runner image will do in §6.4, so all three paths now agree.
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install -r requirements.txt
+
+      - name: Put the venv on PATH
+        # So every later step calls `dbt` directly, exactly as a human would.
+        run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Record the versions under test
         run: dbt --version
