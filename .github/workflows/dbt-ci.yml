@@ -1,0 +1,98 @@
+# Phase 1 §6.2 + §6.3 — the hermetic half of CI.
+#
+# This workflow runs entirely inside GitHub's cloud and needs ZERO connectivity
+# into the homelab, which is the point: under CGNAT there is none. It therefore
+# only ever selects the `dev` (DuckDB) target. The `prod` (ClickHouse) target in
+# profiles.yml is unreachable from here by design and must never be selected.
+#
+# It builds no images and publishes no packages. §6.4 does that, in its own
+# workflow, because pushing to ghcr is the first step that reaches outward.
+
+name: dbt CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push supersedes the first. Nothing here has side effects outside the
+# runner, so cancelling an in-flight run is free.
+concurrency:
+  group: dbt-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege. This job reads the repo and writes nothing back — not to this
+# repo, and not to homelab-infra. Flux is the only thing that writes manifests.
+permissions:
+  contents: read
+
+jobs:
+  dbt:
+    name: parse, compile and test on DuckDB
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: dbt
+
+    env:
+      # profiles.yml lives in the project, not in ~/.dbt, so it can be version
+      # controlled and baked into the runner image in §6.4.
+      DBT_PROFILES_DIR: .
+      # Keep the scratch warehouse out of the tree the artifact step reads.
+      DBT_DUCKDB_PATH: ${{ runner.temp }}/ci.duckdb
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+          cache-dependency-glob: dbt/requirements.txt
+
+      - name: Install dbt-core and the adapters
+        # Installed from the pinned requirements.txt, never re-resolved, so a CI
+        # run a month from now installs exactly what was verified today.
+        run: uv pip install --system -r requirements.txt
+
+      - name: Record the versions under test
+        run: dbt --version
+
+      # ---- §6.2 -------------------------------------------------------------
+
+      - name: dbt deps
+        run: dbt deps
+
+      - name: dbt parse
+        # --warn-error promotes every warning to an error. It is what catches
+        # config paths that match no resource, and other drift that is harmless
+        # today and load-bearing later.
+        run: dbt --warn-error parse
+
+      - name: dbt compile
+        run: dbt --warn-error compile
+
+      # ---- §6.3 -------------------------------------------------------------
+
+      - name: dbt run
+        # The models must exist in DuckDB before they can be tested. DuckDB is
+        # in-process and file-backed, so this needs no service container.
+        run: dbt --warn-error run
+
+      - name: dbt test
+        run: dbt --warn-error test
+
+      # ---- artifact ---------------------------------------------------------
+
+      - name: Upload target/manifest.json
+        # §6.5 will publish this same file as a Release asset. Uploading it here
+        # first means the manifest and the run that produced it are always
+        # traceable to one commit, even for pull requests that publish nothing.
+        uses: actions/upload-artifact@v7
+        with:
+          name: dbt-manifest-${{ github.sha }}
+          path: dbt/target/manifest.json
+          if-no-files-found: error
+          retention-days: 7

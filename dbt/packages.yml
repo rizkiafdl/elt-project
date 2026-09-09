@@ -1,0 +1,11 @@
+# Declared so `dbt deps` in CI is a real step and not a no-op. dbt_utils is the
+# standard macro package and Phase 2 step 8 will use it (surrogate keys, date
+# spines, generic tests), so installing it now costs nothing and proves the
+# dependency-resolution path works before there is real work riding on it.
+#
+# Pinned to a compatible range, not a floating version: a CI run must be
+# reproducible, and a package that changes under you turns a green build red
+# with no commit to blame.
+packages:
+  - package: dbt-labs/dbt_utils
+    version: [">=1.3.0", "<2.0.0"]
