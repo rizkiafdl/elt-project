@@ -39,8 +39,11 @@ jobs:
       # profiles.yml lives in the project, not in ~/.dbt, so it can be version
       # controlled and baked into the runner image in §6.4.
       DBT_PROFILES_DIR: .
-      # Keep the scratch warehouse out of the tree the artifact step reads.
-      DBT_DUCKDB_PATH: ${{ runner.temp }}/ci.duckdb
+      # DBT_DUCKDB_PATH is deliberately NOT set here. The obvious value,
+      # ${{ runner.temp }}/ci.duckdb, is invalid: the `runner` context does not
+      # exist in job-level env and GitHub rejects the whole workflow file for it,
+      # before any step runs. The default `dev.duckdb` lands in dbt/, which is
+      # gitignored and is not the directory the artifact step reads.
 
     steps:
       - name: Check out the repository
