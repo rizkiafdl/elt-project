@@ -103,7 +103,7 @@ DBT_PROFILE_NAME = "elt_project"
 # ⚠️ NOT CONSUMED YET. §10.3 is what puts this into `operator_args`; until then the
 # constant is written, verified and committed but nothing reads it. That seam is
 # deliberate: §10.2 owns how the value ARRIVES, §10.3 owns how the pod USES it.
-DBT_RUNNER_IMAGE = "ghcr.io/rizkiafdl/dbt-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000"  # ci:dbt-runner-digest
+DBT_RUNNER_IMAGE = "ghcr.io/rizkiafdl/dbt-runner@sha256:62742bfdef7b380b9b42ec3065ad98ba448f3f6cf2658a5410e1000f8788a7a7"  # ci:dbt-runner-digest
 
 # `dev` is the DuckDB target. The `prod` ClickHouse target is promoted at §11.5,
 # which is also when its credentials arrive and §9.3's "Connections declared in
