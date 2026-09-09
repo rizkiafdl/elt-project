@@ -371,9 +371,17 @@ jobs:
         # 🚩 THIS CANNOT BECOME A BUILD LOOP, for two independent reasons:
         #   1. GitHub does not start a workflow run for a push authenticated with
         #      the built-in GITHUB_TOKEN. This is the primary guard.
-        #   2. `[skip ci]` in the message. Belt and braces, and the guard that
-        #      still holds if someone later swaps in a PAT -- which WOULD trigger
-        #      runs, and would loop forever without it.
+        #   2. The skip-ci token in the message. Belt and braces, and the guard
+        #      that still holds if someone later swaps in a PAT -- which WOULD
+        #      trigger runs, and would loop forever without it.
+        #
+        # 🚩 DO NOT WRITE THAT TOKEN IN A COMMIT MESSAGE THAT SHOULD BUILD. GitHub
+        # matches it anywhere in the head commit message, including in prose that
+        # is only DESCRIBING the mechanism. This was learned the expensive way on
+        # 2026-09-10: the commit that introduced this very step explained the guard
+        # in its own body, and GitHub silently started no run at all -- no error, no
+        # skipped run in the list, nothing to click. If a push produces no run,
+        # check the commit message before checking the workflow syntax.
         #
         # ⚠️ FAILING THIS STEP DOES NOT MEAN THE RUN IS BAD. If the push loses a
         # race with a human push three times, the job goes red while both images
