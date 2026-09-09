@@ -1,0 +1,21 @@
+name: elt_project
+version: 1.0.0
+config-version: 2
+
+# Selects a block in profiles.yml. Both targets live under this one name.
+profile: elt_project
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  elt_project:
+    staging:
+      +materialized: view
+    # intermediate/ and marts/ are created empty for Phase 2 step 8. Their config
+    # blocks are deliberately absent: dbt warns on config paths that match no
+    # resource, and CI runs with --warn-error, so an unused path would fail the build.

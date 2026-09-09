@@ -1,0 +1,25 @@
+version: 2
+
+models:
+  - name: stg_placeholder_events
+    description: >
+      Phase 1 §6.1 placeholder. Three literal rows, no upstream source. Present so the
+      GitHub Actions pipeline has a real model to parse, compile and test against the
+      DuckDB target. Replaced by the real staging layer in Phase 2 step 8.
+    columns:
+      - name: event_id
+        description: Synthetic surrogate key.
+        data_tests:
+          - not_null
+          - unique
+      - name: event_type
+        description: Placeholder event class.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ["signup", "login", "purchase"]
+      - name: actor
+        description: Placeholder actor handle.
+        data_tests:
+          - not_null

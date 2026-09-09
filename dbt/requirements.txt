@@ -1,0 +1,6 @@
+clickhouse-connect==1.8.0
+dbt-adapters==1.22.10
+dbt-clickhouse==1.10.2
+dbt-core==1.11.15
+dbt-duckdb==1.11.0
+duckdb==1.5.5
