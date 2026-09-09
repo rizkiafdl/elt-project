@@ -1,0 +1,9 @@
+# Cosmos pinned to the range verified in elt-pipeline-verification.md §4:
+# 1.14.2 was current stable at verification (2026-05-21), supports Airflow
+# 2.9-2.11 and 3.0-3.3, and puts manifest_path on ProjectConfig.
+#
+# NOTE 2026-09-09: Cosmos 1.15.1 has since been released. The <1.15 bound was
+# "pin to the version that was verified", not a known incompatibility with 1.15.
+# Revisit it deliberately — re-verify the ProjectConfig/RenderConfig API and the
+# KUBERNETES execution-mode caveats before moving. Do not bump it silently.
+astronomer-cosmos[kubernetes]>=1.14,<1.15

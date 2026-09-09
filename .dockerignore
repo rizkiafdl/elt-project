@@ -1,0 +1,14 @@
+# Build context hygiene. Everything here either does not belong in an image or
+# would bust the layer cache on every commit.
+.git
+.github
+.venv
+**/.venv
+**/target
+**/dbt_packages
+**/logs
+**/*.duckdb
+**/*.duckdb.wal
+**/.user.yml
+**/__pycache__
+*.md

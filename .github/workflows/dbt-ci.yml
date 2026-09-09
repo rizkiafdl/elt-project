@@ -15,11 +15,13 @@ on:
     branches: [main]
   pull_request:
 
-# A second push supersedes the first. Nothing here has side effects outside the
-# runner, so cancelling an in-flight run is free.
+# A second push supersedes the first — but ONLY for pull requests. A PR run has
+# no side effects outside the runner, so cancelling it is free. A run on `main`
+# publishes container images, and cancelling that mid-push can leave a tag
+# pointing at an incomplete upload. Never make this unconditionally true.
 concurrency:
   group: dbt-ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Least privilege. This job reads the repo and writes nothing back — not to this
 # repo, and not to homelab-infra. Flux is the only thing that writes manifests.
@@ -117,3 +119,92 @@ jobs:
           path: dbt/target/manifest.json
           if-no-files-found: error
           retention-days: 7
+
+  # ---- §6.4 ---------------------------------------------------------------
+
+  images:
+    name: build and push ${{ matrix.image }} to ghcr
+    # No image is ever published from a commit whose tests did not pass. This is
+    # why §6.4 lives in the same workflow as §6.2/§6.3 rather than its own: a
+    # separate workflow could only express this with workflow_run, which fires
+    # after the fact and would publish first.
+    needs: dbt
+    # Pull requests must not publish. They run the job above and stop there.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      # Granted on THIS JOB ONLY. The dbt job above stays contents:read — it has
+      # no reason to be able to write packages, and a workflow-level grant would
+      # hand it that ability for free.
+      packages: write
+
+    strategy:
+      # Build both images even if one fails, so a single broken Dockerfile does
+      # not hide the state of the other.
+      fail-fast: false
+      matrix:
+        include:
+          - image: dbt-runner
+            dockerfile: dbt-runner/Dockerfile
+          - image: airflow
+            dockerfile: airflow/Dockerfile
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # The built-in token, scoped by the packages:write grant above. No PAT
+          # is involved in the push side.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=${{ matrix.image }}
+            org.opencontainers.image.description=Homelab ELT ${{ matrix.image }} image
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          # The build context is the repository root for both images: the
+          # dbt-runner Dockerfile copies dbt/, and the airflow one copies
+          # airflow/. Neither can be built from its own subdirectory.
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Layer cache lives in the Actions cache, not in the registry, so a
+          # cache miss never publishes anything.
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          provenance: false
+
+      - name: Record the digest
+        # §7 and Phase 2 step 10 pin DIGESTS, not tags, with
+        # imagePullPolicy: IfNotPresent. Print it where a human can copy it.
+        run: |
+          {
+            echo "### ${{ matrix.image }}"
+            echo ''
+            echo '```'
+            echo 'ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
