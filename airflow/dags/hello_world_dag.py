@@ -60,7 +60,7 @@ from airflow.sdk import dag, task
 
 # Bump this by hand on every re-test. It is the only value in the log that proves
 # the running image was built from the latest commit rather than a cached one.
-HELLO_MARKER = "v1"
+HELLO_MARKER = "v2"
 
 
 @dag(
