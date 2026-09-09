@@ -1,13 +1,16 @@
 -- PLACEHOLDER MODEL — Phase 1 §6.1.
 --
--- It exists so the CI pipeline has something real to run: `dbt parse`, `dbt compile`
--- and `dbt test` all need a resolvable model, and a workflow that compiles nothing
--- proves nothing. Phase 2 step 8 replaces this with the real staging layer; the CI
--- workflow does not change when that happens.
+-- It exists so the CI pipeline has something real to resolve: `dbt parse` needs a
+-- resolvable model, and a workflow that parses nothing proves nothing. Phase 2 step 8
+-- replaces this with the real staging layer.
 --
--- Written with literal rows and no `source()` on purpose: it must build identically
--- on DuckDB (CI) and ClickHouse (in-cluster) with no data loaded and no seed step.
--- Nothing here is adapter-specific SQL.
+-- ⚠️ THE REASON IT HAS NO `source()` HAS CHANGED, AND THAT MATTERS FOR ITS
+-- REPLACEMENT. It was written with literal rows so it would build identically on
+-- DuckDB (CI) and ClickHouse (in-cluster) with no data loaded. The DuckDB target was
+-- removed on 2026-09-10, so "builds on both" is no longer a requirement of anything.
+-- What remains true is narrower: CI only PARSES, so a model here needs to resolve, not
+-- to have data behind it. The real staging layer WILL read `source()` — and it will be
+-- parsed in CI and executed only in the cluster.
 
 select 1 as event_id, 'signup'   as event_type, 'alice' as actor
 union all

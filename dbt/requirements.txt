@@ -1,6 +1,11 @@
+# dbt and the ClickHouse adapter. Pinned exactly, never re-resolved, so a build a
+# month from now installs what was verified today.
+#
+# ⚠️ dbt-duckdb AND duckdb WERE REMOVED ON 2026-09-10, with the `dev` target that
+# used them (see profiles.yml). Nothing in this project targets DuckDB any more.
+# Putting them back means putting the target back; do not re-add them on their own
+# because a command asked for them.
 clickhouse-connect==1.8.0
 dbt-adapters==1.22.10
 dbt-clickhouse==1.10.2
 dbt-core==1.11.15
-dbt-duckdb==1.11.0
-duckdb==1.5.5

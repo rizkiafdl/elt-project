@@ -105,11 +105,21 @@ DBT_PROFILE_NAME = "elt_project"
 # deliberate: §10.2 owns how the value ARRIVES, §10.3 owns how the pod USES it.
 DBT_RUNNER_IMAGE = "ghcr.io/rizkiafdl/dbt-runner@sha256:62742bfdef7b380b9b42ec3065ad98ba448f3f6cf2658a5410e1000f8788a7a7"  # ci:dbt-runner-digest
 
-# `dev` is the DuckDB target. The `prod` ClickHouse target is promoted at §11.5,
-# which is also when its credentials arrive and §9.3's "Connections declared in
-# Git" condition starts to bite. DuckDB needs no credential, so nothing is
-# declared here yet.
-DBT_TARGET = "dev"
+# ⚠️ WAS "dev" (DuckDB) UNTIL 2026-09-10. The DuckDB target was removed at Rizki's
+# direction, so "prod" is not a promotion here — it is the only target that exists
+# (source: dbt/profiles.yml, which now has exactly one output).
+#
+# 🚩 THIS STRING IS INERT TODAY AND WILL NOT STAY INERT. No dbt pod has ever been
+# spawned: §10.3 has not written `operator_args`, this DAG is paused, and its
+# schedule is None. So changing it writes nothing to ClickHouse right now. The
+# moment §10.5 spawns its first pod, that pod talks to the REAL warehouse — there
+# is no longer a harmless target to fail into.
+#
+# 🚩 CONSEQUENCE FOR THE TRIPWIRES. §11.1 (off-box backups) and §11.2 (the
+# ClickHouse memory mis-sizing) were written as preconditions to §11.5, because
+# §11.5 was where production was first touched. Removing DuckDB moves that moment
+# earlier, to §10.5. The tripwires did not move; the thing they guard did.
+DBT_TARGET = "prod"
 
 # ✅ DECIDED AT §10.1 ON 2026-09-10 — route B. This is no longer a placeholder.
 # `ExecutionMode.KUBERNETES` is kept (one pod per dbt node, which is what the plan

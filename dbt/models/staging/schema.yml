@@ -4,8 +4,9 @@ models:
   - name: stg_placeholder_events
     description: >
       Phase 1 §6.1 placeholder. Three literal rows, no upstream source. Present so the
-      GitHub Actions pipeline has a real model to parse, compile and test against the
-      DuckDB target. Replaced by the real staging layer in Phase 2 step 8.
+      GitHub Actions pipeline has a real model to resolve. ⚠️ It used to be compiled and
+      tested against a DuckDB target; that target was removed on 2026-09-10 and CI now
+      only parses. Replaced by the real staging layer in Phase 2 step 8.
     columns:
       - name: event_id
         description: Synthetic surrogate key.

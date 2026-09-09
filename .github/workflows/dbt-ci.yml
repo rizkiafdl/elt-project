@@ -1,9 +1,25 @@
 # Phase 1 §6.2 + §6.3 — the hermetic half of CI.
 #
 # This workflow runs entirely inside GitHub's cloud and needs ZERO connectivity
-# into the homelab, which is the point: under CGNAT there is none. It therefore
-# only ever selects the `dev` (DuckDB) target. The `prod` (ClickHouse) target in
-# profiles.yml is unreachable from here by design and must never be selected.
+# into the homelab, which is the point: under CGNAT there is none.
+#
+# ⚠️ IT NO LONGER EXECUTES ANY MODEL, AND THAT IS A DELIBERATE REDUCTION MADE ON
+# 2026-09-10. The DuckDB `dev` target was removed at Rizki's direction, and with it
+# went the only warehouse CI could reach. `dbt run` and `dbt test` are gone from
+# this file. So is `dbt compile` -- compile OPENS A CONNECTION and fails here with
+# `Database Error ... Connection refused`, which is not obvious until you try it.
+#
+# WHAT SURVIVES, AND WHY IT IS ENOUGH TO KEEP THE ESTATE WORKING: `dbt parse` does
+# NOT connect to anything. Measured against a blackhole address, it returns in
+# about a second and writes a complete manifest.json -- 7 nodes, the same count the
+# old DuckDB compile produced. That manifest is the artifact the whole cluster
+# depends on: §6.5 publishes it, an hourly CronJob syncs it onto a PVC, and Cosmos
+# renders the Airflow DAG from it. None of that changes.
+#
+# 🚩 WHAT IS LOST, SO NOBODY IS SURPRISED BY IT. A model that parses but produces
+# wrong SQL is no longer caught at merge time. There is no green build to trust any
+# more -- only a green parse. The first thing that executes a model is a task pod
+# in the cluster.
 #
 # The `dbt` job below builds no images and publishes no packages. The three jobs
 # after it do: §6.4 pushes two images to ghcr, §6.5 publishes the manifest as a
@@ -33,7 +49,7 @@ permissions:
 
 jobs:
   dbt:
-    name: parse, compile and test on DuckDB
+    name: parse the project and produce the manifest
     runs-on: ubuntu-latest
 
     defaults:
@@ -42,13 +58,28 @@ jobs:
 
     env:
       # profiles.yml lives in the project, not in ~/.dbt, so it can be version
-      # controlled and baked into the runner image in §6.4.
+      # controlled and baked into the runner image.
       DBT_PROFILES_DIR: .
-      # DBT_DUCKDB_PATH is deliberately NOT set here. The obvious value,
-      # ${{ runner.temp }}/ci.duckdb, is invalid: the `runner` context does not
-      # exist in job-level env and GitHub rejects the whole workflow file for it,
-      # before any step runs. The default `dev.duckdb` lands in dbt/, which is
-      # gitignored and is not the directory the artifact step reads.
+
+      # ⚠️ THESE ARE PLACEHOLDERS AND NOTHING EVER CONNECTS TO THEM.
+      #
+      # profiles.yml resolves `env_var('CLICKHOUSE_HOST')` WITH NO DEFAULT, on
+      # purpose: this repository is public and a plausible-looking default would be
+      # a disclosure. But that means dbt cannot even LOAD the profile unless the
+      # variables are set -- and the failure is at profile-render time, before any
+      # command runs, which reads like a broken profiles.yml rather than a missing
+      # variable.
+      #
+      # `dbt parse` opens no connection, so any syntactically valid value works.
+      # These use the RFC 2606 reserved `.invalid` TLD and a documentation address
+      # from RFC 5737, both of which are guaranteed never to resolve to a real
+      # host. If a command is ever added here that DOES connect, it will fail
+      # against these rather than silently reach something.
+      CLICKHOUSE_HOST: ci.invalid
+      CLICKHOUSE_PORT: '8123'
+      CLICKHOUSE_USER: ci-parse-only
+      CLICKHOUSE_ELT_WRITER_PASSWORD: ci-parse-only
+      CLICKHOUSE_DATABASE: elt
 
     steps:
       - name: Check out the repository
@@ -65,7 +96,7 @@ jobs:
           enable-cache: true
           cache-dependency-glob: dbt/requirements.txt
 
-      - name: Install dbt-core and the adapters
+      - name: Install dbt-core and the ClickHouse adapter
         # Installed into a venv, from the pinned requirements.txt, never
         # re-resolved — a CI run a month from now installs exactly what was
         # verified today.
@@ -73,8 +104,6 @@ jobs:
         # NOT `uv pip install --system`. The runner's system interpreter is
         # externally managed (PEP 668) and uv refuses it outright:
         #   error: The interpreter at /usr is externally managed
-        # A venv is also what the README tells a human to do and what the
-        # dbt-runner image will do in §6.4, so all three paths now agree.
         run: |
           uv venv --python 3.12 .venv
           uv pip install -r requirements.txt
@@ -92,30 +121,46 @@ jobs:
         run: dbt deps
 
       - name: dbt parse
+        # THE ONLY dbt COMMAND LEFT THAT TOUCHES THE PROJECT, and the only one that
+        # can run here at all. It resolves every ref, source, macro and test, and
+        # writes target/manifest.json.
+        #
         # --warn-error promotes every warning to an error. It is what catches
         # config paths that match no resource, and other drift that is harmless
-        # today and load-bearing later.
+        # today and load-bearing later. Keep it: with run and test gone, this flag
+        # is now carrying most of what is left of the safety net.
         run: dbt --warn-error parse
 
-      - name: dbt compile
-        run: dbt --warn-error compile
-
-      # ---- §6.3 -------------------------------------------------------------
-
-      - name: dbt run
-        # The models must exist in DuckDB before they can be tested. DuckDB is
-        # in-process and file-backed, so this needs no service container.
-        run: dbt --warn-error run
-
-      - name: dbt test
-        run: dbt --warn-error test
+      - name: Fail if the manifest is empty or missing
+        # 🚩 A MANIFEST WITH ZERO NODES IS THE FAILURE THIS ESTATE CANNOT SEE.
+        # `dbt parse` succeeds on a project whose models all failed to be
+        # discovered, and §6.5 would then publish an empty manifest to the rolling
+        # Release, the CronJob would sync it, and Cosmos would render a DAG with no
+        # tasks -- which looks exactly like "nothing has changed yet" rather than
+        # like a broken build. Nothing downstream checks this, so it is checked
+        # here.
+        #
+        # This check is NEW and exists because run/test were removed. It replaces
+        # nothing; it covers a gap those commands used to cover by accident.
+        run: |
+          set -euo pipefail
+          test -f target/manifest.json
+          python3 - <<'PY'
+          import json, sys
+          m = json.load(open("target/manifest.json"))
+          nodes = len(m.get("nodes", {}))
+          models = sum(1 for v in m["nodes"].values() if v["resource_type"] == "model")
+          print(f"manifest: {nodes} nodes, {models} models")
+          if models < 1:
+              sys.exit("::error::manifest contains no models -- refusing to publish it")
+          PY
 
       # ---- artifact ---------------------------------------------------------
 
       - name: Upload target/manifest.json
-        # §6.5 will publish this same file as a Release asset. Uploading it here
-        # first means the manifest and the run that produced it are always
-        # traceable to one commit, even for pull requests that publish nothing.
+        # §6.5 publishes this same file as a Release asset. Uploading it here first
+        # means the manifest and the run that produced it are always traceable to
+        # one commit, even for pull requests that publish nothing.
         uses: actions/upload-artifact@v7
         with:
           name: dbt-manifest-${{ github.sha }}
@@ -150,10 +195,10 @@ jobs:
 
   dbt-runner-image:
     name: build and push dbt-runner to ghcr
-    # No image is ever published from a commit whose tests did not pass. This is
-    # why §6.4 lives in the same workflow as §6.2/§6.3 rather than its own: a
-    # separate workflow could only express this with workflow_run, which fires
-    # after the fact and would publish first.
+    # No image is ever published from a commit that did not parse. ⚠️ That used to
+    # read "whose tests did not pass", and it does not any more -- the tests were
+    # removed with the DuckDB target on 2026-09-10. The gate is weaker than it was;
+    # it is still the strongest one available without a reachable warehouse.
     needs: dbt
     # Pull requests must not publish. They run the dbt job and stop there.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -433,9 +478,10 @@ jobs:
 
   manifest:
     name: publish manifest.json as a Release asset
-    # Same gate as the image job: the manifest describes a dbt project whose
-    # tests passed. `needs: dbt` also gives access to that job's uploaded
-    # artifact, which is the point — see the download step below.
+    # Same gate as the image jobs: the manifest describes a dbt project that
+    # parsed cleanly and was checked for emptiness. ⚠️ It no longer means "a project
+    # whose tests passed" -- see the dbt job. `needs: dbt` also gives access to that
+    # job's uploaded artifact, which is the point — see the download step below.
     needs: dbt
     # Pull requests must not publish. The dbt job still uploads the run
     # artifact for them; only the Release is restricted to main.
@@ -462,10 +508,11 @@ jobs:
 
     steps:
       - name: Download the manifest the dbt job produced
-        # Deliberately NOT a second `dbt compile`. Recompiling here would
-        # produce a manifest that no test ever ran against; downloading the
-        # artifact guarantees the published file is byte-identical to the one
-        # `dbt test` passed on, in this same run.
+        # Deliberately NOT a second `dbt parse`. Re-parsing here would produce a
+        # manifest that the emptiness check never saw; downloading the artifact
+        # guarantees the published file is byte-identical to the one that was
+        # checked, in this same run. ⚠️ This step used to say `dbt compile` and
+        # `dbt test` -- both are gone (2026-09-10); the reasoning is unchanged.
         #
         # Pinned to v7 to match upload-artifact@v7 above. v8 is current, but
         # the pair must agree on the artifact backend, and v7 is what was

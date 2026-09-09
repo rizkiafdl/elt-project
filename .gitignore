@@ -5,7 +5,10 @@ target/
 dbt_packages/
 logs/
 
-# DuckDB scratch warehouse (CI + local dev target). Disposable by design.
+# DuckDB scratch warehouse. The `dev` target that produced these was removed on
+# 2026-09-10, so nothing writes them any more. The patterns stay: an old working
+# copy can still hold one, and committing a warehouse file to a public repository
+# would publish whatever it contains.
 *.duckdb
 *.duckdb.wal
 
