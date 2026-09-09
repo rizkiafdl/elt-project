@@ -233,6 +233,12 @@ jobs:
       #   https://github.com/<owner>/<repo>/releases/download/manifest-latest/manifest.json
       RELEASE_TAG: manifest-latest
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Required. This job runs NO actions/checkout — it needs no source, only
+      # the artifact. Without a .git directory `gh` cannot infer which repo it
+      # is talking to and every subcommand dies before it reaches the API with:
+      #   failed to run git: fatal: not a git repository
+      # GH_REPO answers that without dragging a full checkout into the job.
+      GH_REPO: ${{ github.repository }}
 
     steps:
       - name: Download the manifest the dbt job produced
