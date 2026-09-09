@@ -62,7 +62,7 @@ a merge runs.
 from __future__ import annotations
 
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pendulum
 import requests
@@ -257,9 +257,29 @@ def stock_market_landing():
             """
         )
 
+        # ⚠️ api_timestamp MUST BE A datetime, NOT A STRING.
+        # It crossed XCom to get here, and XCom serialises to JSON, so what arrives
+        # is the string the fetch task produced. clickhouse-connect binds a DateTime
+        # column by calling .timestamp() on the value, so a string fails inside the
+        # driver's column serialiser with `'str' object has no attribute 'timestamp'`
+        # -- an error that names neither the column's source nor XCom. Measured, not
+        # predicted: this is what the first end-to-end run actually did.
+        api_timestamp = datetime.strptime(row["api_timestamp"], "%Y-%m-%d %H:%M:%S")
+
         # The retry guard. See the module docstring for why the window is the run
         # and not all of history.
-        window_start = context["data_interval_start"].in_timezone("UTC").to_datetime_string()
+        #
+        # ⚠️ data_interval_start IS None ON A MANUAL TRIGGER that carries no logical
+        # date, which is exactly how the README tells a person to test this DAG. The
+        # fallbacks keep the guard working there: the run's own `run_after` if the
+        # scheduler set one, and otherwise a plain one-hour window, which matches the
+        # schedule this DAG runs on.
+        interval_start = context.get("data_interval_start")
+        if interval_start is None:
+            interval_start = getattr(context.get("dag_run"), "run_after", None)
+        if interval_start is None:
+            interval_start = pendulum.now("UTC").subtract(hours=1)
+        window_start = pendulum.instance(interval_start).in_timezone("UTC").to_datetime_string()
         already = client.query(
             f"""
             SELECT count()
@@ -300,10 +320,11 @@ def stock_market_landing():
         # ingested_at is omitted on purpose so ClickHouse's DEFAULT now() supplies
         # it. That keeps the ingestion clock on the database, which is the only
         # clock every reader of this table shares.
+        values = [api_timestamp if column == "api_timestamp" else row[column] for column in columns]
         client.insert(
             table=CLICKHOUSE_TABLE,
             database=CLICKHOUSE_DATABASE,
-            data=[[row[column] for column in columns]],
+            data=[values],
             column_names=columns,
         )
         print(f"Inserted {row['ticker']} @ {row['api_timestamp']} (price {row['current_price']}).")
