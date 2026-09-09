@@ -11,12 +11,19 @@ reason the manifest route was chosen.
 The three literals below are fixed by Phase 1 §7.1 and are not free choices:
 namespace ``elt``, claim ``dbt-manifest``, path ``/opt/manifests/manifest.json``.
 
-API CORRECTION, VERIFIED AGAINST THE INSTALLED COSMOS (1.14.2)
---------------------------------------------------------------
+API CORRECTION, VERIFIED AGAINST THE INSTALLED COSMOS
+----------------------------------------------------
 ``manifest_path`` belongs on ``ProjectConfig``, NOT on ``RenderConfig``.
 ``RenderConfig`` carries ``load_method=LoadMode.DBT_MANIFEST``. An earlier draft of
 the plan had this the other way round; do not reintroduce it from memory. Checked
 with ``inspect.signature`` inside the running dag-processor pod, not from docs.
+
+First verified on Cosmos 1.14.2. §10.1 moved the pin to ``>=1.15.1,<1.16`` on
+2026-09-10 and re-checked the ``ProjectConfig`` / ``RenderConfig`` /
+``ExecutionConfig`` dataclass fields field-by-field across the two releases: the
+diff is ADDITIVE ONLY, and every keyword this file passes still exists and still
+lives on the same class. The reason for the bump is a pod-``command`` bug, not an
+API need — see ``airflow/requirements.txt``.
 
 WHY dbt_project_path IS None ON ProjectConfig BUT SET ON ExecutionConfig
 -----------------------------------------------------------------------
@@ -55,17 +62,68 @@ DBT_PROJECT_PATH = "/usr/local/dbt/elt_project"
 DBT_PROJECT_NAME = "elt_project"
 DBT_PROFILE_NAME = "elt_project"
 
+# ── THE dbt-runner IMAGE — §10.2 ───────────────────────────────────────────────
+# WHAT THIS LINE IS, AND WHY IT LOOKS LIKE THAT
+#
+# §10.2 decided where the dbt-runner digest lives: HERE, in the DAG, in the public
+# `elt-project` repository. The alternative was `homelab-infra`, and it was rejected
+# for a concrete reason — the digest is consumed by `operator_args` on this DAG
+# object, so putting it in the other repository would mean the Airflow image and the
+# value it needs ship from two different commits that nothing keeps in step. That is
+# exactly the manifest/image skew hazard §10.4 exists to make loud, and there is no
+# reason to create a second instance of it on purpose.
+#
+# ⚠️ THE LINE BELOW IS REWRITTEN BY CI. DO NOT EDIT IT BY HAND.
+# `.github/workflows/dbt-ci.yml` builds dbt-runner first, substitutes the digest that
+# build produced into this exact line, builds the airflow image FROM THE REWRITTEN
+# TREE, and only then commits the rewrite back to `main`. The order matters and is
+# not an implementation detail:
+#
+#   * The image is built from the rewritten file, so the running DAG always carries
+#     the digest of the dbt-runner image built from ITS OWN commit. The two images
+#     can no longer drift, because one build produces both.
+#   * The commit back is bookkeeping — it keeps `main` honest about what is running.
+#     If that push loses a race and is retried away, the IMAGE IS STILL CORRECT; only
+#     git lags. That is the safe direction to fail in.
+#
+# The commit back does not start a second CI run. A push authenticated with the
+# built-in `GITHUB_TOKEN` does not trigger workflows, and the commit message also
+# carries `[skip ci]` as a second guard, so this cannot become a build loop.
+#
+# The marker comment at the end of the line is the substitution anchor. Removing it
+# does not break the build — it breaks the REWRITE, silently, and CI then fails at
+# its own verification step rather than publishing an image pinned to the
+# placeholder.
+#
+# 🚩 THE PLACEHOLDER IS ALL ZEROS ON PURPOSE. It is not a valid digest and cannot be
+# pulled. If the rewrite ever no-ops and the verification is bypassed, a task pod
+# fails at `ImagePullBackOff` — loud and immediate — instead of quietly running some
+# older dbt-runner that happens to still be in the node's image cache.
+#
+# ⚠️ NOT CONSUMED YET. §10.3 is what puts this into `operator_args`; until then the
+# constant is written, verified and committed but nothing reads it. That seam is
+# deliberate: §10.2 owns how the value ARRIVES, §10.3 owns how the pod USES it.
+DBT_RUNNER_IMAGE = "ghcr.io/rizkiafdl/dbt-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000"  # ci:dbt-runner-digest
+
 # `dev` is the DuckDB target. The `prod` ClickHouse target is promoted at §11.5,
 # which is also when its credentials arrive and §9.3's "Connections declared in
 # Git" condition starts to bite. DuckDB needs no credential, so nothing is
 # declared here yet.
 DBT_TARGET = "dev"
 
-# ⚠️ OWNED BY §10.1, NOT BY THIS FILE. §10.1 decides the execution mode and settles
-# the astronomer-cosmos <1.15 pin as one decision. KUBERNETES is the plan's choice
-# and §10.1's current recommendation, so it is the honest default to render
-# against — but the pod details (image, digest, env, RBAC, operator_args) are
-# §10.3's, and are deliberately absent here. §9 renders; §10 executes.
+# ✅ DECIDED AT §10.1 ON 2026-09-10 — route B. This is no longer a placeholder.
+# `ExecutionMode.KUBERNETES` is kept (one pod per dbt node, which is what the plan
+# asked for) and the astronomer-cosmos pin moves to `>=1.15.1,<1.16` in the same
+# decision, because the two are one question: `ExecutionMode.WATCHER` only exists
+# above the old bound, and the pod-`command` bug that route A shared is only
+# FIXABLE above it.
+#
+# The pod details — image, env, RBAC, `operator_args` — are still §10.3's and are
+# still deliberately absent here. §9 renders; §10 executes.
+#
+# 🚩 §10.3 MUST PASS `cmds: ["dbt"]` IN `operator_args`. The dbt-runner image has
+# `ENTRYPOINT ["dbt"]`, and Cosmos otherwise puts the executable in `arguments`,
+# producing `dbt dbt run --select ...` in the pod. Detail: findings topic 19.
 EXECUTION_MODE = ExecutionMode.KUBERNETES
 
 # ⚠️ THE SINGLE LARGEST LEVER ON POD COUNT, SET DELIBERATELY RATHER THAN INHERITED.

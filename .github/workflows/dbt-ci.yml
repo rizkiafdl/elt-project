@@ -5,8 +5,11 @@
 # only ever selects the `dev` (DuckDB) target. The `prod` (ClickHouse) target in
 # profiles.yml is unreachable from here by design and must never be selected.
 #
-# It builds no images and publishes no packages. §6.4 does that, in its own
-# workflow, because pushing to ghcr is the first step that reaches outward.
+# The `dbt` job below builds no images and publishes no packages. The three jobs
+# after it do: §6.4 pushes two images to ghcr, §6.5 publishes the manifest as a
+# Release asset, and §10.2 commits one line back to this repository. Everything
+# outward-facing is downstream of a green `dbt` job, and that ordering is the
+# reason they all live in one workflow file rather than in several.
 
 name: dbt CI
 
@@ -120,16 +123,39 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # ---- §6.4 ---------------------------------------------------------------
+  # ---- §6.4 + §10.2 -------------------------------------------------------
+  #
+  # THESE TWO JOBS WERE ONE MATRIX JOB UNTIL 2026-09-10, AND SPLITTING THEM IS THE
+  # WHOLE OF §10.2.
+  #
+  # §10.2 decided that the dbt-runner digest lives in the DAG —
+  # `airflow/dags/elt_dag.py`, in this repository. That creates a real ordering
+  # dependency where there was none: the airflow image contains a file that has to
+  # name the dbt-runner image, so dbt-runner must be published FIRST and its digest
+  # substituted into the tree BEFORE the airflow image is built.
+  #
+  # A matrix cannot express that. The two images used to build in parallel because
+  # they were genuinely independent; they are not independent any more.
+  #
+  # What this buys: one CI run produces both images, and the airflow image it
+  # produces is pinned to the dbt-runner image from the SAME COMMIT. The
+  # manifest/image skew hazard this phase carries (see the phase-2 index, "The
+  # hazard this phase has to solve") cannot occur between these two images, because
+  # there is no window in which they come from different builds.
+  #
+  # 🚩 WHAT THIS DOES NOT FIX. The MANIFEST still reaches the cluster on its own
+  # hourly schedule, through the rolling Release, and can still be newer or older
+  # than the dbt-runner image the DAG names. §10.2 removes one of the two skews.
+  # §10.4 is what makes the remaining one loud.
 
-  images:
-    name: build and push ${{ matrix.image }} to ghcr
+  dbt-runner-image:
+    name: build and push dbt-runner to ghcr
     # No image is ever published from a commit whose tests did not pass. This is
     # why §6.4 lives in the same workflow as §6.2/§6.3 rather than its own: a
     # separate workflow could only express this with workflow_run, which fires
     # after the fact and would publish first.
     needs: dbt
-    # Pull requests must not publish. They run the job above and stop there.
+    # Pull requests must not publish. They run the dbt job and stop there.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
@@ -140,16 +166,10 @@ jobs:
       # hand it that ability for free.
       packages: write
 
-    strategy:
-      # Build both images even if one fails, so a single broken Dockerfile does
-      # not hide the state of the other.
-      fail-fast: false
-      matrix:
-        include:
-          - image: dbt-runner
-            dockerfile: dbt-runner/Dockerfile
-          - image: airflow
-            dockerfile: airflow/Dockerfile
+    outputs:
+      # The reason this job exists as a separate job at all. `digest` is an
+      # immutable content address; the airflow job substitutes it into the DAG.
+      digest: ${{ steps.build.outputs.digest }}
 
     steps:
       - name: Check out the repository
@@ -171,12 +191,11 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          images: ghcr.io/${{ github.repository_owner }}/dbt-runner
           # Three tags, each with a different job.
           #
           #   sha-<40 hex>  traceability. Maps an image back to the exact commit.
-          #                 Every digest recorded in the infra repo so far was
-          #                 resolved through this tag. It is never removed.
+          #                 It is never removed.
           #   latest        convenience for a human pulling the image by hand.
           #                 Nothing in the cluster deploys from it.
           #   build-<UTC>   ordering. A Flux ImagePolicy has to sort the tag list
@@ -192,36 +211,213 @@ jobs:
             type=raw,value=latest
             type=raw,value=build-{{date 'YYYYMMDDHHmmss' tz='UTC'}}
           labels: |
-            org.opencontainers.image.title=${{ matrix.image }}
-            org.opencontainers.image.description=Homelab ELT ${{ matrix.image }} image
+            org.opencontainers.image.title=dbt-runner
+            org.opencontainers.image.description=Homelab ELT dbt-runner image
 
       - name: Build and push
         id: build
         uses: docker/build-push-action@v7
         with:
-          # The build context is the repository root for both images: the
-          # dbt-runner Dockerfile copies dbt/, and the airflow one copies
-          # airflow/. Neither can be built from its own subdirectory.
+          # The build context is the repository root: the dbt-runner Dockerfile
+          # copies dbt/, so it cannot be built from its own subdirectory.
           context: .
-          file: ${{ matrix.dockerfile }}
+          file: dbt-runner/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # Layer cache lives in the Actions cache, not in the registry, so a
           # cache miss never publishes anything.
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          cache-from: type=gha,scope=dbt-runner
+          cache-to: type=gha,mode=max,scope=dbt-runner
           provenance: false
 
       - name: Record the digest
-        # §7 and Phase 2 step 10 pin DIGESTS, not tags, with
-        # imagePullPolicy: IfNotPresent. Print it where a human can copy it.
         run: |
           {
-            echo "### ${{ matrix.image }}"
+            echo '### dbt-runner'
             echo ''
             echo '```'
-            echo 'ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}'
+            echo 'ghcr.io/${{ github.repository_owner }}/dbt-runner@${{ steps.build.outputs.digest }}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  airflow-image:
+    name: pin the dbt-runner digest, then build and push airflow to ghcr
+    # ⚠️ THIS `needs` IS LOAD-BEARING, NOT COSMETIC. It is what guarantees the
+    # digest exists before the file that names it is rewritten. If dbt-runner
+    # fails to build, no airflow image is published either — which is correct:
+    # an airflow image pinned to an image that does not exist is worse than no
+    # new airflow image at all.
+    needs: dbt-runner-image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    permissions:
+      # `write`, unlike every other job in this workflow, and it is the one
+      # privilege escalation §10.2 introduces. It is needed for the commit-back
+      # step at the end, and for nothing else. Scoped to this job.
+      contents: write
+      packages: write
+
+    env:
+      DBT_RUNNER_REF: ghcr.io/${{ github.repository_owner }}/dbt-runner@${{ needs.dbt-runner-image.outputs.digest }}
+      DAG_FILE: airflow/dags/elt_dag.py
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          # Required by the commit-back step. Without it the checkout leaves no
+          # credential in .git/config and `git push` fails at authentication,
+          # AFTER the image has already been published — a confusing half-done
+          # state. Set explicitly rather than relying on the action's default.
+          persist-credentials: true
+
+      - name: Pin the dbt-runner digest into the DAG
+        # The substitution is anchored on the trailing `# ci:dbt-runner-digest`
+        # marker, not on the variable name, so a rename of the constant does not
+        # silently break it -- it breaks it loudly, at the verification step below.
+        run: |
+          set -euo pipefail
+          test -n "${{ needs.dbt-runner-image.outputs.digest }}"
+          python3 - <<'PY'
+          import os, re, sys
+
+          path = os.environ["DAG_FILE"]
+          ref  = os.environ["DBT_RUNNER_REF"]
+          src  = open(path).read()
+
+          pattern = re.compile(
+              r'^DBT_RUNNER_IMAGE = "[^"]*"  # ci:dbt-runner-digest$', re.M
+          )
+          if len(pattern.findall(src)) != 1:
+              sys.exit(
+                  f"expected exactly one ci:dbt-runner-digest marker line in {path}; "
+                  f"found {len(pattern.findall(src))}. The rewrite anchor is gone -- "
+                  "restore it rather than removing this check."
+              )
+
+          src = pattern.sub(
+              f'DBT_RUNNER_IMAGE = "{ref}"  # ci:dbt-runner-digest', src
+          )
+          open(path, "w").write(src)
+          print(f"pinned {ref}")
+          PY
+
+      - name: Verify the pin took
+        # 🚩 THE STEP THAT STOPS A PLACEHOLDER FROM BEING PUBLISHED. The rewrite
+        # above is a regex substitution, and a regex that matches nothing is not an
+        # error to the shell. Without this check a broken anchor would ship an
+        # airflow image whose DAG names an all-zero digest, and the failure would
+        # surface days later as ImagePullBackOff on a task pod.
+        run: |
+          set -euo pipefail
+          grep -qF "$DBT_RUNNER_REF" "$DAG_FILE" \
+            || { echo "::error::the dbt-runner digest was not substituted into $DAG_FILE"; exit 1; }
+          if grep -q 'sha256:0\{64\}' "$DAG_FILE"; then
+            echo "::error::$DAG_FILE still contains the all-zero placeholder digest"
+            exit 1
+          fi
+          echo "pinned: $DBT_RUNNER_REF"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/airflow
+          # Same three tags, same three reasons, as dbt-runner above. The
+          # `build-<UTC>` tag is the one the Flux ImagePolicy sorts on (§12.2).
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest
+            type=raw,value=build-{{date 'YYYYMMDDHHmmss' tz='UTC'}}
+          labels: |
+            org.opencontainers.image.title=airflow
+            org.opencontainers.image.description=Homelab ELT airflow image
+
+      - name: Build and push
+        id: build
+        # ⚠️ BUILT FROM THE REWRITTEN WORKING TREE, NOT FROM THE COMMIT. This is
+        # the point of the whole job order. `airflow/Dockerfile` copies
+        # `airflow/dags/`, so the image picks up the substitution made two steps
+        # above without the change having been committed yet.
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: airflow/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=airflow
+          cache-to: type=gha,mode=max,scope=airflow
+          provenance: false
+
+      - name: Commit the pinned digest back to main
+        # BOOKKEEPING, NOT A BUILD INPUT. The image is already published and
+        # already correct by the time this runs. This step exists so that `main`
+        # tells the truth about what is deployed, and so a reader of the DAG sees
+        # a real digest instead of the placeholder.
+        #
+        # 🚩 THIS CANNOT BECOME A BUILD LOOP, for two independent reasons:
+        #   1. GitHub does not start a workflow run for a push authenticated with
+        #      the built-in GITHUB_TOKEN. This is the primary guard.
+        #   2. `[skip ci]` in the message. Belt and braces, and the guard that
+        #      still holds if someone later swaps in a PAT -- which WOULD trigger
+        #      runs, and would loop forever without it.
+        #
+        # ⚠️ FAILING THIS STEP DOES NOT MEAN THE RUN IS BAD. If the push loses a
+        # race with a human push three times, the job goes red while both images
+        # are published and consistent. Re-running the rewrite is safe and
+        # idempotent; the correct recovery is to push again, not to delete images.
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- "$DAG_FILE"; then
+            echo "digest unchanged -- nothing to commit"
+            exit 0
+          fi
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$DAG_FILE"
+          git commit -m "Pin dbt-runner digest in elt_dag.py (§10.2) [skip ci]" \
+                     -m "$DBT_RUNNER_REF" \
+                     -m "Written by .github/workflows/dbt-ci.yml from the digest of the dbt-runner image built in run ${{ github.run_id }}, from commit ${{ github.sha }}. Not written by a person. To change which image the DAG uses, push a commit -- do not edit this line by hand."
+          # Retry against a moving main. The rebase replays one small,
+          # single-line commit, so a conflict here is not expected and is worth
+          # investigating rather than forcing.
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:${{ github.ref_name }}"; then
+              echo "pushed on attempt $attempt"
+              exit 0
+            fi
+            echo "push rejected on attempt $attempt -- rebasing onto the current main"
+            git pull --rebase origin "${{ github.ref_name }}"
+          done
+          echo "::error::could not push the digest commit after 3 attempts. Both images ARE published and consistent; only git lags."
+          exit 1
+
+      - name: Record the digest
+        run: |
+          {
+            echo '### airflow'
+            echo ''
+            echo '```'
+            echo 'ghcr.io/${{ github.repository_owner }}/airflow@${{ steps.build.outputs.digest }}'
+            echo '```'
+            echo ''
+            echo 'DAG pinned to:'
+            echo ''
+            echo '```'
+            echo "$DBT_RUNNER_REF"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
