@@ -7,3 +7,21 @@
 # Revisit it deliberately — re-verify the ProjectConfig/RenderConfig API and the
 # KUBERNETES execution-mode caveats before moving. Do not bump it silently.
 astronomer-cosmos[kubernetes]>=1.14,<1.15
+
+# ── §13 stock_market_landing DAG ───────────────────────────────────────────────
+# Both of these are ALREADY PINNED BY THE AIRFLOW CONSTRAINTS FILE this image
+# builds against (constraints-3.3.1/constraints-3.12.txt):
+#
+#   requests==2.34.2          already present in the image transitively
+#   clickhouse-connect==1.6.0
+#
+# They are pinned to those exact versions here rather than left unbounded, because
+# `--constraint` would silently decide them anyway and a reader of this file should
+# not have to fetch a URL to learn what the image contains.
+#
+# ⚠️ DO NOT RAISE clickhouse-connect ABOVE THE CONSTRAINT. 1.8.0 is the current
+# release, but asking for it makes pip fail the build outright — a requirement and
+# a constraint that disagree is an error, not a negotiation. Moving it means moving
+# the Airflow version whose constraints file names it.
+requests==2.34.2
+clickhouse-connect==1.6.0
