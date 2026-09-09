@@ -172,9 +172,25 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          # Three tags, each with a different job.
+          #
+          #   sha-<40 hex>  traceability. Maps an image back to the exact commit.
+          #                 Every digest recorded in the infra repo so far was
+          #                 resolved through this tag. It is never removed.
+          #   latest        convenience for a human pulling the image by hand.
+          #                 Nothing in the cluster deploys from it.
+          #   build-<UTC>   ordering. A Flux ImagePolicy has to sort the tag list
+          #                 to elect one as newest, and neither of the two tags
+          #                 above can be sorted: a hex SHA has no order, and
+          #                 "latest" is a single fixed string. This stamp is
+          #                 monotonic per build, so `numerical: { order: asc }`
+          #                 over the extracted digits always elects the most
+          #                 recent image. Format is YYYYMMDDHHmmss in UTC --
+          #                 fixed width, so numeric and lexical order agree.
           tags: |
             type=sha,format=long
             type=raw,value=latest
+            type=raw,value=build-{{date 'YYYYMMDDHHmmss' tz='UTC'}}
           labels: |
             org.opencontainers.image.title=${{ matrix.image }}
             org.opencontainers.image.description=Homelab ELT ${{ matrix.image }} image
