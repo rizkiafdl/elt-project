@@ -208,3 +208,90 @@ jobs:
             echo 'ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---- §6.5 ---------------------------------------------------------------
+
+  manifest:
+    name: publish manifest.json as a Release asset
+    # Same gate as the image job: the manifest describes a dbt project whose
+    # tests passed. `needs: dbt` also gives access to that job's uploaded
+    # artifact, which is the point — see the download step below.
+    needs: dbt
+    # Pull requests must not publish. The dbt job still uploads the run
+    # artifact for them; only the Release is restricted to main.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    permissions:
+      # Granted on THIS JOB ONLY, and `contents: write` is what creating a
+      # Release and uploading an asset requires. The dbt job stays read-only.
+      contents: write
+
+    env:
+      # The rolling tag §7's CronJob will fetch from. It never changes, so the
+      # cluster hard-codes one URL and never has to resolve "latest":
+      #   https://github.com/<owner>/<repo>/releases/download/manifest-latest/manifest.json
+      RELEASE_TAG: manifest-latest
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Download the manifest the dbt job produced
+        # Deliberately NOT a second `dbt compile`. Recompiling here would
+        # produce a manifest that no test ever ran against; downloading the
+        # artifact guarantees the published file is byte-identical to the one
+        # `dbt test` passed on, in this same run.
+        #
+        # Pinned to v7 to match upload-artifact@v7 above. v8 is current, but
+        # the pair must agree on the artifact backend, and v7 is what was
+        # verified (`git/ref/tags/v7` resolves; the alias is published).
+        uses: actions/download-artifact@v7
+        with:
+          name: dbt-manifest-${{ github.sha }}
+          path: manifest
+
+      - name: Create the rolling release if it does not exist yet
+        # `gh` is preinstalled on ubuntu-latest, so no third-party action is in
+        # this path at all. First run creates the tag and the release; every
+        # later run finds it and skips.
+        #
+        # TRAP: the git tag stays at the commit that first created it. It does
+        # NOT follow main. Do not read the tag as "the commit this manifest came
+        # from" — the release body below carries that, and is rewritten each run.
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "release $RELEASE_TAG already exists"
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "dbt manifest (rolling)" \
+              --notes "Bootstrapping. The body is rewritten on every push to main." \
+              --target "${{ github.sha }}"
+          fi
+
+      - name: Upload manifest.json, replacing the previous one
+        # --clobber is required: without it, uploading an asset whose name
+        # already exists on the release fails. The asset name is the fixed
+        # filename on purpose, so the download URL never changes.
+        run: gh release upload "$RELEASE_TAG" manifest/manifest.json --clobber
+
+      - name: Record which commit this manifest came from
+        # The only place the provenance is written, since the tag cannot move.
+        run: |
+          gh release edit "$RELEASE_TAG" --notes "$(
+            printf '%s\n' \
+              'Rolling release. `manifest.json` is replaced on every push to `main`.' \
+              '' \
+              "Source commit: \`${{ github.sha }}\`" \
+              "Produced by: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '' \
+              'The git tag does not move. Read the source commit above, not the tag.'
+          )"
+
+      - name: Show the fetch URL §7 will use
+        run: |
+          {
+            echo '### manifest.json'
+            echo ''
+            echo '```'
+            echo '${{ github.server_url }}/${{ github.repository }}/releases/download/'"$RELEASE_TAG"'/manifest.json'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
