@@ -19,3 +19,10 @@
 -- arithmetic less pointed.
 
 select 1 as probe_id
+
+-- REUSED 2026-09-10 for §10.4's gate. This comment changes the manifest's checksum
+-- and therefore forces a new CI run number onto it, WITHOUT adding a node. That is
+-- deliberate: the §10.4 guard compares PROVENANCE (which CI run built each artifact),
+-- not model lists, so the skew it must catch does not require a real new model. What a
+-- new model would add is the model-not-found error the guard exists to pre-empt, and
+-- §9.7 already measured that a new model becomes a new task with no DAG edit.
