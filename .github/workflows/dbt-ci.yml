@@ -61,6 +61,28 @@ jobs:
       # controlled and baked into the runner image.
       DBT_PROFILES_DIR: .
 
+      # ── §10.4 — THE MANIFEST HALF OF THE SKEW GUARD ─────────────────────────
+      # dbt copies every variable prefixed `DBT_ENV_CUSTOM_ENV_` into
+      # manifest.json -> metadata.env, KEEPING THE FULL NAME (the prefix is not
+      # stripped). `dbt parse` below is the step that writes that file, so these
+      # two only have to be visible to it.
+      #
+      # 🚩 THESE ARE READ BY airflow/dags/elt_dag.py AT DAG PARSE TIME. The DAG
+      # compares them against the two constants CI rewrites into it (markers
+      # `ci:build-source-sha` and `ci:build-ci-run`) and REFUSES TO RENDER when
+      # the manifest is newer than the image. Removing either variable here does
+      # not fail this job -- it fails the DAG, an hour later, on the cluster.
+      #
+      # WHY run_number AND NOT A TIMESTAMP. The two artifacts must be ORDERED
+      # against each other, and they are built minutes apart inside one run, so
+      # their own build times cannot order them. `github.run_number` is one
+      # monotonic integer per workflow, and BOTH artifacts of a run get the same
+      # value -- which is exactly the property the comparison needs. A hex SHA
+      # cannot be ordered at all; it is carried alongside only to name the commit
+      # in the error message.
+      DBT_ENV_CUSTOM_ENV_GIT_SHA: ${{ github.sha }}
+      DBT_ENV_CUSTOM_ENV_CI_RUN: ${{ github.run_number }}
+
       # ⚠️ THESE ARE PLACEHOLDERS AND NOTHING EVER CONNECTS TO THEM.
       #
       # profiles.yml resolves `env_var('CLICKHOUSE_HOST')` WITH NO DEFAULT, on
@@ -308,6 +330,13 @@ jobs:
       DBT_RUNNER_REF: ghcr.io/${{ github.repository_owner }}/dbt-runner@${{ needs.dbt-runner-image.outputs.digest }}
       DAG_FILE: airflow/dags/elt_dag.py
 
+      # ── §10.4 — THE IMAGE HALF OF THE SKEW GUARD ────────────────────────────
+      # The same two values the `dbt` job stamps into manifest.json. One run
+      # writes both halves, which is the whole basis of the comparison. See the
+      # long comment on the `dbt` job's env block.
+      BUILD_SOURCE_SHA: ${{ github.sha }}
+      BUILD_CI_RUN: ${{ github.run_number }}
+
     steps:
       - name: Check out the repository
         uses: actions/checkout@v7
@@ -318,10 +347,23 @@ jobs:
           # state. Set explicitly rather than relying on the action's default.
           persist-credentials: true
 
-      - name: Pin the dbt-runner digest into the DAG
-        # The substitution is anchored on the trailing `# ci:dbt-runner-digest`
-        # marker, not on the variable name, so a rename of the constant does not
-        # silently break it -- it breaks it loudly, at the verification step below.
+      - name: Pin the dbt-runner digest and the build stamps into the DAG
+        # THREE substitutions, each anchored on its own trailing marker comment
+        # rather than on the variable name, so renaming a constant does not
+        # silently break the rewrite -- it breaks it loudly, right here.
+        #
+        #   ci:dbt-runner-digest  §10.2  which image a task pod runs
+        #   ci:build-source-sha   §10.4  which commit this DAG + that image are from
+        #   ci:build-ci-run       §10.4  which CI run built them, for ORDERING
+        #
+        # The last two are the image half of the skew guard. Their manifest half is
+        # set on the `dbt` job's env block, from the same two GitHub context values,
+        # in the same run -- which is what makes the DAG's comparison meaningful.
+        #
+        # ⚠️ ci:build-ci-run IS A BARE INTEGER, NOT A QUOTED STRING. The DAG compares
+        # it with `<`, so quoting it would compare two strings and order "10" before
+        # "9". The substitution table below writes each value with the right literal
+        # form; do not collapse the three entries into one regex.
         run: |
           set -euo pipefail
           test -n "${{ needs.dbt-runner-image.outputs.digest }}"
@@ -329,32 +371,53 @@ jobs:
           import os, re, sys
 
           path = os.environ["DAG_FILE"]
-          ref  = os.environ["DBT_RUNNER_REF"]
-          src  = open(path).read()
+          src   = open(path).read()
 
-          pattern = re.compile(
-              r'^DBT_RUNNER_IMAGE = "[^"]*"  # ci:dbt-runner-digest$', re.M
-          )
-          if len(pattern.findall(src)) != 1:
-              sys.exit(
-                  f"expected exactly one ci:dbt-runner-digest marker line in {path}; "
-                  f"found {len(pattern.findall(src))}. The rewrite anchor is gone -- "
-                  "restore it rather than removing this check."
-              )
+          # (marker, constant name, the literal to write)
+          subs = [
+              ("ci:dbt-runner-digest", "DBT_RUNNER_IMAGE", '"%s"' % os.environ["DBT_RUNNER_REF"]),
+              ("ci:build-source-sha",  "BUILD_SOURCE_SHA", '"%s"' % os.environ["BUILD_SOURCE_SHA"]),
+              ("ci:build-ci-run",      "BUILD_CI_RUN",     os.environ["BUILD_CI_RUN"]),
+          ]
 
-          src = pattern.sub(
-              f'DBT_RUNNER_IMAGE = "{ref}"  # ci:dbt-runner-digest', src
-          )
+          # A CI run number must be an integer, because the DAG orders on it.
+          if not os.environ["BUILD_CI_RUN"].isdigit():
+              sys.exit(f"BUILD_CI_RUN is not an integer: {os.environ['BUILD_CI_RUN']!r}")
+
+          done = []
+
+          for marker, name, literal in subs:
+              pattern = re.compile(rf'^{name} = .*  # {re.escape(marker)}$', re.M)
+              found = pattern.findall(src)
+              if len(found) != 1:
+                  sys.exit(
+                      f"expected exactly one {marker} marker line in {path}; "
+                      f"found {len(found)}. The rewrite anchor is gone -- restore it "
+                      "rather than removing this check."
+                  )
+              src = pattern.sub(f'{name} = {literal}  # {marker}', src)
+              done.append(f"pinned {name} = {literal}")
+
+          # Written once, after every substitution has been proven to match. A
+          # missing anchor above leaves the file UNTOUCHED rather than half-pinned,
+          # and nothing is reported as pinned until it actually is.
           open(path, "w").write(src)
-          print(f"pinned {ref}")
+          print("\n".join(done))
           PY
 
-      - name: Verify the pin took
+      - name: Verify the pins took
         # 🚩 THE STEP THAT STOPS A PLACEHOLDER FROM BEING PUBLISHED. The rewrite
         # above is a regex substitution, and a regex that matches nothing is not an
         # error to the shell. Without this check a broken anchor would ship an
         # airflow image whose DAG names an all-zero digest, and the failure would
         # surface days later as ImagePullBackOff on a task pod.
+        #
+        # §10.4 added two more values with the same exposure, and a WORSE failure
+        # shape: an un-rewritten `BUILD_CI_RUN = 0` compares as older than every real
+        # manifest, so the skew guard would raise on EVERY parse and the DAG would
+        # never render at all. Check all three, and check the file still parses --
+        # the substitution writes Python, and a bad literal is only visible to a
+        # compiler, not to grep.
         run: |
           set -euo pipefail
           grep -qF "$DBT_RUNNER_REF" "$DAG_FILE" \
@@ -363,6 +426,36 @@ jobs:
             echo "::error::$DAG_FILE still contains the all-zero placeholder digest"
             exit 1
           fi
+          python3 -m py_compile "$DAG_FILE" \
+            || { echo "::error::$DAG_FILE does not compile after the substitution"; exit 1; }
+          python3 - <<'PY'
+          import ast, os, sys
+
+          path = os.environ["DAG_FILE"]
+          want = {
+              "BUILD_SOURCE_SHA": os.environ["BUILD_SOURCE_SHA"],
+              "BUILD_CI_RUN":     int(os.environ["BUILD_CI_RUN"]),
+          }
+          got = {}
+          for node in ast.parse(open(path).read()).body:
+              if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") in want:
+                  got[node.targets[0].id] = ast.literal_eval(node.value)
+
+          bad = False
+          for name, expected in want.items():
+              actual = got.get(name, "<missing>")
+              if actual != expected:
+                  print(f"::error::{name} is {actual!r} after the rewrite, expected {expected!r}")
+                  bad = True
+              else:
+                  print(f"verified {name} = {actual!r}")
+          # Belt and braces: the placeholders must be gone, whatever the expected
+          # values happen to be.
+          if got.get("BUILD_SOURCE_SHA") == "0" * 40 or got.get("BUILD_CI_RUN") == 0:
+              print("::error::the §10.4 build stamps are still at their placeholder values")
+              bad = True
+          sys.exit(1 if bad else 0)
+          PY
           echo "pinned: $DBT_RUNNER_REF"
 
       - name: Set up Buildx

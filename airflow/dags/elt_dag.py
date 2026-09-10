@@ -44,11 +44,16 @@ git-sync, so the pod must already contain what it runs.
 
 from __future__ import annotations
 
+import json
+import logging
 from datetime import datetime
 
+from airflow.exceptions import AirflowException
 from cosmos import DbtDag, ExecutionConfig, ProfileConfig, ProjectConfig, RenderConfig
 from cosmos.constants import ExecutionMode, LoadMode, TestBehavior
 from kubernetes.client import models as k8s
+
+log = logging.getLogger(__name__)
 
 # ── FIXED LITERALS ─────────────────────────────────────────────────────────────
 # Phase 1 §7.1. A mismatch here surfaces as a DAG that vanishes from the UI with an
@@ -255,6 +260,145 @@ OPERATOR_ARGS = {
         k8s.V1EnvFromSource(secret_ref=k8s.V1SecretEnvSource(name="clickhouse-elt-writer")),
     ],
 }
+
+# ── §10.4 — THE MANIFEST/IMAGE SKEW GUARD ──────────────────────────────────────
+# THE PROBLEM THIS EXISTS FOR
+#
+# This DAG is rendered from `manifest.json` on a PVC, and executed by the
+# `dbt-runner` image pinned above. Those two artifacts are built by ONE CI run from
+# ONE commit, but they REACH THE CLUSTER BY DIFFERENT ROUTES, on different clocks:
+#
+#   manifest -> `manifest-sync` CronJob, `schedule: "17 * * * *"`  -> up to 60 min
+#   image    -> Flux ImageRepository 5m + ImagePolicy 5m
+#               + ImageUpdateAutomation 5m + Kustomization 10m      -> ~5-25 min
+#   (source: homelab-infra/flux/manifest-sync/cronjob.yaml,
+#            homelab-infra/flux/image-automation/*.yaml)
+#
+# So after a merge the two halves arrive minutes to an hour apart, and there are two
+# skewed states. They are NOT symmetric:
+#
+#   * IMAGE AHEAD, manifest behind (the common case, because the image route is
+#     faster). The DAG renders the OLD task list. A new model exists inside the
+#     image and nothing calls it. Harmless, silent, and looks like "my model did
+#     not deploy". -> WARN, do not raise.
+#
+#   * MANIFEST AHEAD, image behind (the dangerous case). The DAG renders a task for
+#     a model the dbt-runner image does not contain, the pod runs
+#     `dbt run --select fqn:...`, and dbt answers `Model ... not found`. THAT ERROR
+#     IS A LIE: it reads like broken SQL, and the SQL is fine. -> RAISE.
+#
+# WHY THIS RAISES AT MODULE SCOPE AND NOT INSIDE A TASK
+#
+# §10.4 requires the failure to be LOUD: "the DAG raises at parse time, or the first
+# task fails with a message naming both versions. Anything that renders a DAG which
+# then fails per-model is not loud enough." Raising here means the dag-processor
+# reports one import error naming both commits, and NO task graph is ever built --
+# so there is nothing to mistake for a dbt problem.
+#
+# 🚩 A RAISE HERE IS NOT ALWAYS A FAULT. During the minutes when the manifest has
+# landed and the image has not, the estate really IS in the broken state, and this
+# guard is reporting it accurately. It clears itself when Flux rolls the image. The
+# message says so, so nobody debugs a deploy that is merely in progress.
+#
+# ⚠️ THE TWO LINES BELOW ARE REWRITTEN BY CI. DO NOT EDIT THEM BY HAND.
+# Same mechanism as the digest above: `.github/workflows/dbt-ci.yml` substitutes on
+# the trailing marker comment, and a verification step fails the build if the
+# substitution did not take. The placeholders are deliberately IMPOSSIBLE values --
+# an all-zero SHA and CI run 0 -- so an un-rewritten DAG compares as older than every
+# real manifest and fails LOUDLY here, rather than quietly running with a stale pin.
+BUILD_SOURCE_SHA = "0000000000000000000000000000000000000000"  # ci:build-source-sha
+BUILD_CI_RUN = 0  # ci:build-ci-run
+
+# The manifest side of the pair. `dbt parse` copies every environment variable
+# prefixed `DBT_ENV_CUSTOM_ENV_` into `manifest.json` -> `metadata.env`, stripping the
+# prefix is NOT done -- the key keeps the full name. Verified against the published
+# manifest before this was written: the `env` object is present in manifest schema
+# v12 unconditionally, and was `{}` until CI started setting these.
+MANIFEST_SHA_KEY = "DBT_ENV_CUSTOM_ENV_GIT_SHA"
+MANIFEST_RUN_KEY = "DBT_ENV_CUSTOM_ENV_CI_RUN"
+
+# One command, quoted here so the error message can hand it over verbatim.
+FORCE_SYNC = (
+    "kubectl create job -n elt --from=cronjob/manifest-sync manifest-sync-manual"
+)
+
+
+def _assert_manifest_matches_image() -> None:
+    """Raise at parse time if the manifest is NEWER than the pinned image.
+
+    Reads nothing but the manifest already mounted for rendering, and compares two
+    values that one CI run wrote into both artifacts. No network call, no registry
+    lookup, no git history -- all three of those record the commit too, and none of
+    them is reachable from a scheduler pod.
+    """
+    try:
+        with open(MANIFEST_PATH) as fh:
+            metadata = json.load(fh).get("metadata", {})
+    except (OSError, ValueError):
+        # Missing, unreadable or malformed manifest is NOT this guard's failure to
+        # report. `RenderConfig(load_method=LoadMode.DBT_MANIFEST)` raises on the same
+        # file moments from now, with a better message. Do not duplicate it.
+        return
+
+    env = metadata.get("env") or {}
+    manifest_sha = env.get(MANIFEST_SHA_KEY)
+    manifest_run = env.get(MANIFEST_RUN_KEY)
+
+    if manifest_sha == BUILD_SOURCE_SHA:
+        return
+
+    # An UNSTAMPED manifest predates §10.4, so it is older than this image by
+    # definition. This is the one-time bootstrap state on the deploy that ships this
+    # guard, and it clears at the next `:17`. Force the sync to skip the wait.
+    if not manifest_sha:
+        raise AirflowException(
+            "manifest/image skew (§10.4) -- the manifest on the PVC carries no "
+            f"{MANIFEST_SHA_KEY}, so it was built before this guard shipped and is "
+            f"older than this image (commit {BUILD_SOURCE_SHA[:12]}, CI run "
+            f"{BUILD_CI_RUN}, manifest generated_at={metadata.get('generated_at')}). "
+            f"Force a manifest sync to clear it: {FORCE_SYNC}"
+        )
+
+    try:
+        manifest_run_n = int(manifest_run)
+    except (TypeError, ValueError):
+        raise AirflowException(
+            "manifest/image skew (§10.4) -- the manifest carries "
+            f"{MANIFEST_SHA_KEY}={manifest_sha[:12]} but its {MANIFEST_RUN_KEY} is "
+            f"{manifest_run!r}, which is not an integer. The two stamps are written "
+            "by the same CI job and must both be present; a manifest with one and "
+            "not the other means the workflow was edited incompletely."
+        ) from None
+
+    if manifest_run_n < BUILD_CI_RUN:
+        # Image ahead. The safe direction: the task list is stale, not wrong.
+        log.warning(
+            "manifest/image skew (§10.4), SAFE DIRECTION -- the image is ahead of the "
+            "manifest. Rendering the older task list. manifest: %s (CI run %d); "
+            "image: %s (CI run %d). Any model added in the newer commit will not "
+            "appear as a task until the manifest-sync CronJob next fires (:17). "
+            "Force it with: %s",
+            manifest_sha[:12], manifest_run_n,
+            BUILD_SOURCE_SHA[:12], BUILD_CI_RUN,
+            FORCE_SYNC,
+        )
+        return
+
+    raise AirflowException(
+        "manifest/image skew (§10.4) -- the manifest is NEWER than the dbt-runner "
+        f"image this DAG pins. manifest: {manifest_sha[:12]} (CI run "
+        f"{manifest_run_n}); image: {BUILD_SOURCE_SHA[:12]} (CI run {BUILD_CI_RUN}). "
+        "Rendering now would create tasks for models the image does not contain, and "
+        "each would fail inside dbt with a model-not-found that reads like broken "
+        "SQL. Refusing to render instead. IF A DEPLOY IS IN PROGRESS THIS CLEARS "
+        "ITSELF when Flux rolls the newer airflow image (~5-25 min: ImageRepository "
+        "5m + ImagePolicy 5m + ImageUpdateAutomation 5m + Kustomization 10m). If it "
+        "does NOT clear, the image half of the deploy is stuck -- check the Flux "
+        "ImagePolicy and the airflow Kustomization, not this DAG and not dbt."
+    )
+
+
+_assert_manifest_matches_image()
 
 elt_dag = DbtDag(
     dag_id="elt_project",
