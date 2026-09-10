@@ -63,9 +63,19 @@ jobs:
 
       # ── §10.4 — THE MANIFEST HALF OF THE SKEW GUARD ─────────────────────────
       # dbt copies every variable prefixed `DBT_ENV_CUSTOM_ENV_` into
-      # manifest.json -> metadata.env, KEEPING THE FULL NAME (the prefix is not
-      # stripped). `dbt parse` below is the step that writes that file, so these
-      # two only have to be visible to it.
+      # manifest.json -> metadata.env. `dbt parse` below is the step that writes
+      # that file, so these two only have to be visible to it.
+      #
+      # 🚩 dbt STRIPS THE PREFIX. `DBT_ENV_CUSTOM_ENV_GIT_SHA` here becomes the key
+      # `GIT_SHA` in metadata.env -- NOT the full name. Measured on run 23, which
+      # shipped the DAG reading the full name and therefore saw an unstamped
+      # manifest:
+      #
+      #   "env": { "GIT_SHA": "557d4061...", "CI_RUN": "23" }
+      #
+      # ⚠️ RENAMING EITHER VARIABLE HERE BREAKS THE DAG, NOT THIS JOB. elt_dag.py
+      # reads the stripped names from MANIFEST_SHA_KEY / MANIFEST_RUN_KEY. Nothing
+      # checks the correspondence automatically. Change both sides together.
       #
       # 🚩 THESE ARE READ BY airflow/dags/elt_dag.py AT DAG PARSE TIME. The DAG
       # compares them against the two constants CI rewrites into it (markers

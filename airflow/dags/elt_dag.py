@@ -309,13 +309,32 @@ OPERATOR_ARGS = {
 BUILD_SOURCE_SHA = "557d4061d75d054a7e4e8daae03a32886299851c"  # ci:build-source-sha
 BUILD_CI_RUN = 23  # ci:build-ci-run
 
-# The manifest side of the pair. `dbt parse` copies every environment variable
-# prefixed `DBT_ENV_CUSTOM_ENV_` into `manifest.json` -> `metadata.env`, stripping the
-# prefix is NOT done -- the key keeps the full name. Verified against the published
-# manifest before this was written: the `env` object is present in manifest schema
-# v12 unconditionally, and was `{}` until CI started setting these.
-MANIFEST_SHA_KEY = "DBT_ENV_CUSTOM_ENV_GIT_SHA"
-MANIFEST_RUN_KEY = "DBT_ENV_CUSTOM_ENV_CI_RUN"
+# The manifest side of the pair.
+#
+# 🚩 dbt STRIPS THE `DBT_ENV_CUSTOM_ENV_` PREFIX. The variable CI sets is
+# `DBT_ENV_CUSTOM_ENV_GIT_SHA`; the key that lands in `metadata.env` is `GIT_SHA`.
+# THE TWO NAMES ARE NOT THE SAME AND THIS FILE MUST USE THE SHORT ONE.
+#
+# This was written the wrong way round first, on the assumption that the full name
+# survived, and shipped in CI run 23. Measured immediately afterwards against the
+# published manifest:
+#
+#   "env": { "GIT_SHA": "557d4061...", "CI_RUN": "23" }
+#
+# (source: curl of the manifest-latest Release asset, 2026-09-10). The guard caught
+# its own defect -- it saw neither key, concluded the manifest was unstamped, and
+# raised -- which is the failure direction the placeholders were chosen to produce.
+#
+# ⚠️ The names below must stay in step with the `DBT_ENV_CUSTOM_ENV_*` variables on
+# the `dbt` job in .github/workflows/dbt-ci.yml, MINUS THE PREFIX. Nothing checks
+# that correspondence automatically; the workflow carries the matching warning.
+MANIFEST_SHA_KEY = "GIT_SHA"
+MANIFEST_RUN_KEY = "CI_RUN"
+
+# What CI must set to produce those keys. Quoted here only so the error messages can
+# name the variable a reader has to go and fix, not just the key that is missing.
+CI_SHA_VAR = f"DBT_ENV_CUSTOM_ENV_{MANIFEST_SHA_KEY}"
+CI_RUN_VAR = f"DBT_ENV_CUSTOM_ENV_{MANIFEST_RUN_KEY}"
 
 # One command, quoted here so the error message can hand it over verbatim.
 FORCE_SYNC = (
@@ -353,7 +372,8 @@ def _assert_manifest_matches_image() -> None:
     if not manifest_sha:
         raise AirflowException(
             "manifest/image skew (§10.4) -- the manifest on the PVC carries no "
-            f"{MANIFEST_SHA_KEY}, so it was built before this guard shipped and is "
+            f"metadata.env[{MANIFEST_SHA_KEY!r}] (set in CI as {CI_SHA_VAR}), so it "
+            "was built before this guard shipped and is "
             f"older than this image (commit {BUILD_SOURCE_SHA[:12]}, CI run "
             f"{BUILD_CI_RUN}, manifest generated_at={metadata.get('generated_at')}). "
             f"Force a manifest sync to clear it: {FORCE_SYNC}"
@@ -365,7 +385,8 @@ def _assert_manifest_matches_image() -> None:
         raise AirflowException(
             "manifest/image skew (§10.4) -- the manifest carries "
             f"{MANIFEST_SHA_KEY}={manifest_sha[:12]} but its {MANIFEST_RUN_KEY} is "
-            f"{manifest_run!r}, which is not an integer. The two stamps are written "
+            f"{manifest_run!r}, which is not an integer. {CI_RUN_VAR} is what sets "
+            "it. The two stamps are written "
             "by the same CI job and must both be present; a manifest with one and "
             "not the other means the workflow was edited incompletely."
         ) from None
