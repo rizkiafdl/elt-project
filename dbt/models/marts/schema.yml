@@ -1,0 +1,74 @@
+version: 2
+
+models:
+  - name: mart_stock_daily_ohlc
+    description: >
+      One row per (ticker, quote_date) — daily open/high/low/close with the count
+      of observations behind it. Materialized as a ClickHouse `MergeTree` table
+      sorted by `(ticker, quote_date)`, which is the filter a consumer will use.
+
+    columns:
+      - name: ticker
+        description: Finnhub symbol.
+        data_tests:
+          - not_null
+      - name: quote_date
+        description: UTC calendar day. Not a market day.
+        data_tests:
+          - not_null
+      - name: open_price
+        description: Finnhub's session open. Describes the whole session.
+      - name: high_price
+        description: Finnhub's session high. Describes the whole session.
+      - name: low_price
+        description: Finnhub's session low. Describes the whole session.
+      - name: close_price
+        description: >
+          ⚠️ The LAST PRICE OBSERVED, not the official close. The loader samples
+          hourly and never sees the closing print.
+      - name: previous_close_price
+        description: Finnhub's previous-session close.
+      - name: observation_count
+        description: Hourly polls that landed in this day, at most 24.
+        data_tests:
+          - not_null
+      - name: distinct_quote_count
+        description: Distinct event times in the day. Equal to 1 means nothing moved.
+      - name: last_quoted_at
+        description: Latest event time in the day.
+      - name: last_ingested_at
+        description: When the last row of this day was written to the warehouse.
+
+  - name: mart_stock_quote_latest
+    description: >
+      One row per ticker — the newest quote the estate has. The "is it working?"
+      model. ⚠️ It is NOT a freshness check: it is a table, so it is only as
+      current as the last dbt run. `dbt source freshness` (§8.2) is what knows
+      whether the loader is alive.
+
+    columns:
+      - name: ticker
+        description: Finnhub symbol. One row per ticker.
+        data_tests:
+          - not_null
+          - unique
+      - name: quoted_at
+        description: Event time of the newest quote.
+        data_tests:
+          - not_null
+      - name: quote_date
+        description: UTC calendar day of the newest quote.
+      - name: current_price
+        description: Last traded price of the newest quote.
+        data_tests:
+          - not_null
+      - name: price_change
+        description: Absolute change against the previous close.
+      - name: price_change_pct
+        description: Percentage change against the previous close.
+      - name: previous_close_price
+        description: Previous-session close.
+      - name: ingested_at
+        description: When the newest quote was written to the warehouse.
+        data_tests:
+          - not_null

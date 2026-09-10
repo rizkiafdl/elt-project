@@ -16,6 +16,17 @@ models:
   elt_project:
     staging:
       +materialized: view
-    # intermediate/ and marts/ are created empty for Phase 2 step 8. Their config
-    # blocks are deliberately absent: dbt warns on config paths that match no
-    # resource, and CI runs with --warn-error, so an unused path would fail the build.
+    # ⚠️ THESE TWO BLOCKS WERE ADDED AT §8.5, IN THE SAME COMMIT AS THE FIRST MODEL
+    # UNDER EACH PATH -- never before it. dbt warns on a config path that matches no
+    # resource and CI runs with --warn-error, so an empty path fails the build.
+    #
+    # Only path-wide defaults live here. Adapter-specific config (`engine`,
+    # `order_by`, `incremental_strategy`) is written in the model file next to the
+    # SQL it changes -- decided at §8.3, because with one adapter left there is
+    # nothing to be portable to and the config is easier to read where it applies.
+    intermediate:
+      +materialized: view
+    marts:
+      # Marts are what a consumer queries, so they are materialized. The cost is
+      # that a mart is only as fresh as the last dbt run.
+      +materialized: table

@@ -1,0 +1,62 @@
+version: 2
+
+models:
+  - name: int_stock_quote_daily
+    description: >
+      One row per (ticker, quote_date). Folds the hourly observations of a UTC day
+      into a single row, keeping the estate's own sampled prices and Finnhub's
+      session figures as separate, explicitly named columns because they are not
+      the same measurement.
+
+    columns:
+      - name: ticker
+        description: Finnhub symbol.
+        data_tests:
+          - not_null
+
+      - name: quote_date
+        description: >
+          UTC calendar day, from `toDate(quoted_at)` in staging. Not a market day —
+          the New York session straddles the UTC boundary.
+        data_tests:
+          - not_null
+
+      - name: observation_count
+        description: >
+          How many hourly polls landed in this day, at most 24. It counts looks,
+          not price movements.
+        data_tests:
+          - not_null
+
+      - name: distinct_quote_count
+        description: >
+          Distinct `quoted_at` values in the day. When this is 1 and
+          `observation_count` is 13, the market was shut and Finnhub returned one
+          frozen quote all day.
+        data_tests:
+          - not_null
+
+      - name: first_quoted_at
+        description: Earliest event time observed in the day.
+      - name: last_quoted_at
+        description: Latest event time observed in the day.
+      - name: first_observed_price
+        description: "`current_price` of the earliest observation. Sampled, not the open."
+      - name: last_observed_price
+        description: "`current_price` of the latest observation. Sampled, not the close."
+      - name: min_observed_price
+        description: Lowest `current_price` the estate saw. A sample floor, not the session low.
+      - name: max_observed_price
+        description: Highest `current_price` the estate saw. A sample ceiling, not the session high.
+      - name: session_open_price
+        description: Finnhub `o` for the session, taken from the latest observation of the day.
+      - name: session_high_price
+        description: Finnhub `h` — the session high, which describes the whole session.
+      - name: session_low_price
+        description: Finnhub `l` — the session low, which describes the whole session.
+      - name: previous_close_price
+        description: Finnhub `pc`, taken from the latest observation of the day.
+      - name: first_ingested_at
+        description: When the first row of this day was written to the warehouse.
+      - name: last_ingested_at
+        description: When the last row of this day was written to the warehouse.
