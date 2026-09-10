@@ -2,6 +2,13 @@ version: 2
 
 models:
   - name: int_stock_quote_daily
+    # §8.6 — the daily fold's own claim: one row per ticker per UTC day.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - ticker
+              - quote_date
     description: >
       One row per (ticker, quote_date). Folds the hourly observations of a UTC day
       into a single row, keeping the estate's own sampled prices and Finnhub's

@@ -18,6 +18,18 @@ version: 2
 
 models:
   - name: stg_stock_quote
+    # §8.6 — THE MODEL'S OWN CLAIM, ASSERTED. Everything else in this file is a
+    # column-level check; this is the one that tests what the model is FOR. The
+    # landing table does not have this grain (one quote was landed 13 times -- see
+    # findings topic 32), so a green run here means the de-duplication worked.
+    # ⚠️ Applied to THIS model, never to the source: on `landing.stock_quote` it
+    # would be red almost all the time while nothing is wrong.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - ticker
+              - quoted_at
     description: >
       One row per (ticker, quoted_at) -- the de-duplicated, renamed view over
       `landing.stock_quote`. This is the first dbt model in the estate that reads

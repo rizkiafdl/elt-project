@@ -2,6 +2,13 @@ version: 2
 
 models:
   - name: mart_stock_daily_ohlc
+    # §8.6 — the grain a consumer will assume when they join to this table.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - ticker
+              - quote_date
     description: >
       One row per (ticker, quote_date) — daily open/high/low/close with the count
       of observations behind it. Materialized as a ClickHouse `MergeTree` table
