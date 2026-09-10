@@ -79,3 +79,52 @@ models:
         description: When the newest quote was written to the warehouse.
         data_tests:
           - not_null
+
+  - name: mart_stock_daily_range
+    # §11.6 condition 5 — the grain, asserted the same way as every other mart.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - ticker
+              - quote_date
+    description: >
+      One row per (ticker, quote_date) — how much of the session's true range the
+      estate's hourly sampling actually observed. Added at §11.6 to prove a model
+      reaches production with no manual step. ⚠️ `session_range` (Finnhub's own
+      high/low, whole session) and `observed_range` (at most 24 hourly polls) are
+      different measurements; `observed_share_of_session_pct` is the ratio between
+      them and is the honest size of the sampling gap.
+
+    columns:
+      - name: ticker
+        description: Finnhub symbol.
+        data_tests:
+          - not_null
+      - name: quote_date
+        description: UTC calendar day. Not a market day.
+        data_tests:
+          - not_null
+      - name: session_range
+        description: Finnhub's session high minus session low. Describes the whole session.
+      - name: session_range_pct
+        description: >
+          `session_range` as a percentage of the session open. NULL when the open
+          is 0, because ClickHouse returns `inf` for Float64 division by zero.
+      - name: observed_range
+        description: >
+          Highest minus lowest `current_price` the loader actually polled. A
+          sample of the session, never the session itself.
+      - name: observed_share_of_session_pct
+        description: >
+          `observed_range` as a percentage of `session_range` — how much of the
+          real range the hourly sampling caught. NULL on a flat session
+          (high == low), which is what a closed-market day looks like.
+      - name: observation_count
+        description: Hourly polls that landed in this day, at most 24.
+        data_tests:
+          - not_null
+      - name: distinct_quote_count
+        description: Distinct event times in the day. Equal to 1 means nothing moved.
+      - name: last_quoted_at
+        description: Latest event time in the day.
