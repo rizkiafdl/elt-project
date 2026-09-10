@@ -46,9 +46,10 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from airflow.exceptions import AirflowException
+from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
 from cosmos import DbtDag, ExecutionConfig, ProfileConfig, ProjectConfig, RenderConfig
 from cosmos.constants import ExecutionMode, LoadMode, TestBehavior
 from kubernetes.client import models as k8s
@@ -115,11 +116,12 @@ DBT_RUNNER_IMAGE = "ghcr.io/rizkiafdl/dbt-runner@sha256:2fae76e887620f3ce58a56be
 # direction, so "prod" is not a promotion here — it is the only target that exists
 # (source: dbt/profiles.yml, which now has exactly one output).
 #
-# 🚩 THIS STRING IS INERT TODAY AND WILL NOT STAY INERT. No dbt pod has ever been
-# spawned: §10.3 has not written `operator_args`, this DAG is paused, and its
-# schedule is None. So changing it writes nothing to ClickHouse right now. The
-# moment §10.5 spawns its first pod, that pod talks to the REAL warehouse — there
-# is no longer a harmless target to fail into.
+# 🚩 THIS STRING WAS INERT AND IS NOT INERT ANY MORE -- both halves of the warning
+# below have now happened, so it is kept as the record of when. WAS: "no dbt pod has
+# ever been spawned; §10.3 has not written `operator_args`, this DAG is paused, and
+# its schedule is None". Since then §10.5 spawned real pods against the REAL
+# warehouse, and §11.5 (2026-09-10) gave this DAG `schedule="5 * * * *"`. There is no
+# longer a harmless target to fail into, and no longer a human deciding when to try.
 #
 # 🚩 CONSEQUENCE FOR THE TRIPWIRES. §11.1 (off-box backups) and §11.2 (the
 # ClickHouse memory mis-sizing) were written as preconditions to §11.5, because
@@ -428,14 +430,43 @@ _assert_manifest_matches_image()
 
 elt_dag = DbtDag(
     dag_id="elt_project",
-    # ⚠️ MANUAL TRIGGER ONLY, ON PURPOSE. How often the source data changes decides
-    # this number, and §8.1 has not answered that yet. Defaulting to @daily would
-    # invent a cadence nobody can defend later.
-    # 🚩 §11.6's exit gate requires a run that was SCHEDULED, not hand-triggered, so
-    # this must be replaced at §11.5. Recorded so it is not lost between §9 and §11.
-    schedule=None,
+    # ✅ §11.5, 2026-09-10. WAS `schedule=None` ("manual trigger only, on purpose")
+    # until the cadence could be defended. It can be now, and every minute below is
+    # taken from a measurement rather than a preference:
+    #
+    #   :00  `stock_market_landing` fires (schedule="0 * * * *"). It is two plain
+    #        tasks in the scheduler pod, no dbt and no pods to spawn, and it lands
+    #        in ~5 s -- observed `ingested_at` 11:00:05 for the 11:00 run.
+    #   :05  THIS DAG. Five minutes is ~60x the observed landing duration, so the
+    #        transform reads a landing table the loader has finished writing.
+    #   :17  `manifest-sync` CronJob replaces the manifest on the PVC
+    #        (source: homelab-infra/flux/manifest-sync/cronjob.yaml).
+    #
+    # 🚩 :05 IS CHOSEN TO SIT BEFORE :17, NOT MERELY AFTER :00. A push landing
+    # between :10 and :16 syncs a NEW manifest at :17 before Flux can roll the
+    # matching image, and `_assert_manifest_matches_image()` then raises at PARSE for
+    # up to ~25 minutes -- correctly, because the estate really is mismatched
+    # (§10.4, findings topic 29 §1). Running at :05 uses a manifest that has been
+    # settled for ~48 minutes and clears that window entirely. Scheduling at, say,
+    # :20 or :30 would put the run inside the one window the guard is designed to
+    # raise in, and would look like a flaky pipeline instead of a working guard.
+    #
+    # Hourly matches the loader by construction. `sources.yml` derives its freshness
+    # thresholds from the SAME hourly cadence (warn_after 2h, error_after 6h), so
+    # changing this schedule means changing those two numbers with it.
+    schedule="5 * * * *",
     start_date=datetime(2026, 9, 9),
+    # catchup=False is load-bearing, not tidiness: start_date is 2026-09-09 and this
+    # DAG became scheduled on 2026-09-10, so catchup=True would queue ~24 backfill
+    # runs at once, each spawning a pod per dbt node, against a warehouse whose
+    # memory ceiling was only just pinned (§11.2).
     catchup=False,
+    # 🚩 ONE RUN AT A TIME. The default is 16. Two concurrent runs would have two
+    # dbt processes building the SAME marts in the SAME database -- `mart_stock_daily_ohlc`
+    # and `mart_stock_quote_latest` are MergeTree tables that dbt rebuilds, not
+    # appends to. If a run ever overruns its hour, the correct behaviour is to skip,
+    # not to race. `stock_market_landing` sets this for the same reason.
+    max_active_runs=1,
     tags=["dbt", "cosmos", "elt"],
     default_args={"retries": 0},
     doc_md=__doc__,
@@ -465,3 +496,65 @@ elt_dag = DbtDag(
     ),
     operator_args=OPERATOR_ARGS,
 )
+
+
+# ── §11.5 — THE SOURCE-FRESHNESS ALARM ─────────────────────────────────────────
+# WHAT IT WATCHES. `sources.yml` declares the contract -- `warn_after: 2 hours`,
+# `error_after: 6 hours` on `landing.stock_quote`, both derived from the loader's
+# hourly schedule. Nothing evaluated that contract on a schedule until this task
+# existed: §8.2 ran it once by hand, from a Job, and closed.
+#
+# 🚩 WHY IT IS NOT JUST `cmds: ["dbt"]` WITH `arguments: ["source", "freshness"]`.
+# `dbt source freshness` EXITS 0 ON A WARN, and `--warn-error` does not change that
+# -- both measured on 2026-09-10 against the real table (findings topic 40). A task
+# that ran dbt directly would be green through the entire WARN band and would only
+# turn red at `error_after`, six hours in, which is an outage rather than an early
+# warning. `/usr/local/bin/freshness-gate` (dbt-runner/freshness-gate.py) runs the
+# same dbt command and then reads the `status` field out of `target/sources.json`,
+# which is the only artifact that carries it.
+#
+# 🚩 DELIBERATELY NOT UPSTREAM OF THE dbt TASKS. It has no dependency edge in either
+# direction, so it runs beside them and never blocks them. A stale source does not
+# make the transform wrong -- the models are a full rebuild from whatever `landing`
+# holds, so a run on two-hour-old rows produces correct marts over slightly old
+# data. Blocking would convert "the loader missed an hour" into "the warehouse
+# stopped updating", which is a strictly worse outage than the one being reported.
+# The task going red IS the alarm; the pipeline keeping going is the point.
+#
+# ⚠️ AND NOTHING WATCHES THE RED. Airflow shows a failed task and emails nobody:
+# no alerting backend is configured anywhere in this estate, which Phase 1 recorded
+# as an open gap and Phase 2 has only widened. "Alerting" here means the run is
+# visibly failed to somebody who looks. Wiring it to something that pages is the
+# first item of whatever observability work follows this phase.
+with elt_dag:
+    KubernetesPodOperator(
+        task_id="source_freshness",
+        name="source-freshness",
+        image=DBT_RUNNER_IMAGE,
+        # Overrides the image's `ENTRYPOINT ["dbt"]`. This is the ONLY setting that
+        # differs from the dbt task pods; see the Dockerfile comment.
+        cmds=["/usr/local/bin/freshness-gate"],
+        arguments=["--target", DBT_TARGET, "--project-dir", DBT_PROJECT_PATH],
+        namespace="elt",
+        in_cluster=True,
+        get_logs=True,
+        image_pull_policy="IfNotPresent",
+        # Same reasoning as OPERATOR_ARGS: keep a FAILED pod for inspection, because
+        # this pod failing is the alarm and its logs are the report.
+        on_finish_action="delete_succeeded_pod",
+        # 🚩 FRESH V1EnvVar OBJECTS, NOT `OPERATOR_ARGS["env_vars"]`. Cosmos rewrites
+        # `operator.env_vars` in place when it builds its own pods (the flattening
+        # documented above), so handing it the same list objects would couple this
+        # task to that rewrite. The VALUES are the same three literals on purpose --
+        # the address and the credential still arrive through `env_from` below and
+        # are still absent from this public repository.
+        env_vars=[
+            k8s.V1EnvVar(name="CLICKHOUSE_PORT", value="8123"),
+            k8s.V1EnvVar(name="CLICKHOUSE_USER", value="elt_writer"),
+            k8s.V1EnvVar(name="CLICKHOUSE_DATABASE", value="elt"),
+        ],
+        env_from=OPERATOR_ARGS["env_from"],
+        # A freshness check is one `SELECT max(ingested_at)`. If it has not answered
+        # in five minutes the warehouse is not answering, which is itself the alarm.
+        execution_timeout=timedelta(minutes=5),
+    )

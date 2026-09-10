@@ -67,6 +67,20 @@ WORKDIR ${DBT_HOME}
 RUN dbt deps --no-version-check \
  && rm -rf /tmp/dbt-logs /tmp/dbt-target
 
+# Phase 2 §11.5 -- the source-freshness alarm.
+#
+# `dbt source freshness` EXITS 0 ON A WARN, and so does `dbt --warn-error source
+# freshness` -- both measured on 2026-09-10 against the real table (findings topic
+# 40). So the alarm cannot be an exit code, and this wrapper reads the `status`
+# field out of `target/sources.json` instead. Its own header carries the evidence.
+#
+# It is installed as an executable on PATH rather than invoked as `python
+# /some/path.py` so that a pod overrides exactly ONE setting -- `cmds` -- and
+# inherits image, env, envFrom, service account and RBAC unchanged from the dbt
+# tasks beside it. One thing different means one thing that can be different.
+COPY dbt-runner/freshness-gate.py /usr/local/bin/freshness-gate
+RUN chmod 0755 /usr/local/bin/freshness-gate
+
 # Non-root. uid 1000 is a plain choice, not inherited from anything.
 RUN useradd --create-home --uid 1000 dbt \
  && chown -R dbt:dbt ${DBT_HOME}
