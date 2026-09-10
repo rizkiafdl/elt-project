@@ -1,0 +1,110 @@
+# Phase 2 §8.2 — the dbt half of the Extract & Load route.
+#
+# The loading half already exists and is NOT dbt's: the `stock_market_landing`
+# Airflow DAG calls the Finnhub `/quote` API every hour and inserts one row into
+# `landing.stock_quote` (§13, proven end to end). This file is the other half —
+# the declaration that lets dbt models read what that loader writes, and the
+# freshness contract that says how old the data is allowed to get.
+#
+# The plan's design rule, which this arrangement keeps: "Keep EL separate from
+# dbt; dbt only transforms what is already in the warehouse." Nothing below
+# fetches anything. A source is a read-only pointer at a table someone else owns.
+#
+# ── FOUR THINGS THAT ARE NOT OBVIOUS, RECORDED HERE RATHER THAN REDISCOVERED ──
+#
+# 1. `schema:` IS THE ClickHouse DATABASE. ClickHouse has no database/schema
+#    split, so dbt-clickhouse maps dbt's `schema` onto the ClickHouse database and
+#    always renders the relation with an empty database part. Setting `database:`
+#    here is at best redundant and at worst fatal: ClickHouseRelation raises
+#    `Cannot set database <x> in clickhouse!` when it differs from the schema
+#    (source: dbt/adapters/clickhouse/relation.py __post_init__, dbt-clickhouse
+#    1.10.2). The relation this file resolves to is `landing`.`stock_quote`.
+#
+# 2. FRESHNESS IS MEASURED ON THE INGESTION CLOCK, NOT THE MARKET CLOCK. This
+#    table carries two genuinely different timestamps. `api_timestamp` is when
+#    Finnhub says the quote was taken; `ingested_at` is when this estate wrote the
+#    row. They diverge by design. Freshness MUST use `ingested_at`: the US market
+#    closes every night and all weekend, so `api_timestamp` stops advancing while
+#    the loader keeps working perfectly — a freshness check on event time would
+#    turn red every evening and stay red until Monday, and it would be wrong every
+#    time. `ingested_at` answers the question freshness is actually for: is our
+#    loader still running?
+#
+# 3. THE THRESHOLDS COME FROM THE LOADER'S SCHEDULE. `stock_market_landing` runs
+#    hourly on `0 * * * *`, so the age of this table sawtooths between ~0 and ~60
+#    minutes while everything is healthy. `warn_after: 2 hours` therefore tolerates
+#    exactly one missed run and complains on the second; `error_after: 6 hours` is
+#    six missed runs, which is no longer a blip. Neither number is a preference —
+#    change the loader's schedule and both must move with it.
+#
+# 4. FRESHNESS CANNOT RUN IN CI, AND MUST NOT BE ADDED THERE. `dbt source
+#    freshness` opens a warehouse connection, and GitHub Actions has no route into
+#    this estate — ClickHouse accepts connections from the k3s node's address only,
+#    enforced by `ufw` on the LXC and by the `elt_writer` account's own HOST IP
+#    restriction. CI runs `dbt parse`, which resolves this file without connecting.
+#    The freshness check runs in the cluster, in a `dbt-runner` pod.
+#
+# ⚠️ ONE MORE, ABOUT PERMISSION. dbt connects as `elt_writer` with `elt` as its
+# default database. Reading `landing.stock_quote` is a cross-database read, and it
+# works only because a grant on `landing` was added by hand as the `default`
+# superuser during §13. It did not come with the account. A fresh estate rebuilt
+# from Terraform alone will parse this file happily and then fail at run time with
+# an access error — that grant is not yet in any code.
+
+version: 2
+
+sources:
+  - name: landing
+    # The ClickHouse database. See note 1 above: do NOT add `database:`.
+    schema: landing
+    description: >
+      Raw, append-only landing zone. Rows are written by Airflow loader DAGs and
+      are never updated and never deleted. Nothing in dbt writes here.
+
+    tables:
+      - name: stock_quote
+        description: >
+          One row per hourly Finnhub `/quote` poll for a single ticker (`AAPL`
+          today). Append-only, ~24 rows per day. The natural key is
+          `(ticker, api_timestamp)` and it is NOT unique in this table — the
+          loader skips a duplicate only when it sees one, so a re-run after a
+          missed hour can legitimately land two rows with the same
+          `api_timestamp`. De-duplication belongs downstream, in `stg_stock_quote`.
+
+        # See note 2: the ingestion clock, deliberately, not `api_timestamp`.
+        loaded_at_field: ingested_at
+        freshness:
+          # See note 3: derived from the loader's hourly schedule.
+          warn_after: {count: 2, period: hour}
+          error_after: {count: 6, period: hour}
+
+        columns:
+          - name: ticker
+            description: Finnhub symbol the quote was requested for, e.g. `AAPL`.
+          - name: current_price
+            description: Finnhub `c` — the last traded price.
+          - name: change
+            description: Finnhub `d` — absolute change against the previous close.
+          - name: change_pct
+            description: Finnhub `dp` — percentage change against the previous close.
+          - name: high
+            description: Finnhub `h` — the session high.
+          - name: low
+            description: Finnhub `l` — the session low.
+          - name: open
+            description: >
+              Finnhub `o` — the session open. ⚠️ `open` is a bare word here and a
+              reserved-ish identifier in some engines; downstream models should
+              quote it or rename it on the way into staging.
+          - name: previous_close
+            description: Finnhub `pc` — the previous session's close.
+          - name: api_timestamp
+            description: >
+              EVENT TIME. When Finnhub says the quote was taken (its `t`, converted
+              from a Unix epoch). Stops advancing whenever the market is shut, which
+              is why freshness does not use it.
+          - name: ingested_at
+            description: >
+              INGESTION TIME. When ClickHouse wrote the row — a column `DEFAULT
+              now()`, so the clock is the database's own and no client can skew it.
+              This is the freshness field.
