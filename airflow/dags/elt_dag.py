@@ -48,6 +48,7 @@ from datetime import datetime
 
 from cosmos import DbtDag, ExecutionConfig, ProfileConfig, ProjectConfig, RenderConfig
 from cosmos.constants import ExecutionMode, LoadMode, TestBehavior
+from kubernetes.client import models as k8s
 
 # ── FIXED LITERALS ─────────────────────────────────────────────────────────────
 # Phase 1 §7.1. A mismatch here surfaces as a DAG that vanishes from the UI with an
@@ -149,6 +150,73 @@ EXECUTION_MODE = ExecutionMode.KUBERNETES
 # loses that isolation.
 TEST_BEHAVIOR = TestBehavior.AFTER_EACH
 
+# ── §10.3 — POD WIRING FOR THE dbt-runner TASK PODS ────────────────────────────
+# ✅ DECIDED AND VERIFIED 2026-09-10. Every key here was checked against the INSTALLED
+# Cosmos 1.15.1 by calling `build_kube_args` and `build_pod_request_obj` on a rendered
+# task in the running scheduler pod and inspecting the resulting `V1Pod` -- not assumed
+# from the constructor signature. Confirmed on that build:
+#   container[0].command == ["dbt"]
+#   container[0].args    == ["run", "--select", "fqn:...", "--profile", "elt_project",
+#                             "--target", "prod", "--project-dir",
+#                             "/usr/local/dbt/elt_project"]
+# i.e. NOT "dbt dbt run ...". `cmds: ["dbt"]` is what makes that branch fire in
+# `build_kube_args` (see the module docstring and §10.1's finding, topic 19).
+#
+# 🚩 THIS FILE CARRIES NO PRIVATE ADDRESS AND NO CREDENTIAL. `elt-project` is public.
+# CLICKHOUSE_HOST is sourced from a ConfigMap (`clickhouse-conn`, key `host`) that lives
+# in `homelab-infra` -- the same seam that repository's `flux/airflow/helmrelease.yaml`
+# already documents at §13.5 for the Airflow chart's own containers. A dbt-runner pod is
+# NOT one of those containers -- it is a fresh pod the scheduler spawns through the
+# Kubernetes API at run time via `KubernetesPodOperator`, and it inherits none of the
+# chart's env. That gap is what §10.3 exists to close.
+#
+# PORT, USER and DATABASE are plain, non-sensitive literals (a port number, a username,
+# a schema name) and are written here directly -- only the address and the password are
+# routed indirectly, because only those two are the kind of fact this repository must
+# never carry.
+#
+# ⚠️ NAME RECONCILED, NOT RENAMED. `dbt/profiles.yml` reads
+# `env_var('CLICKHOUSE_ELT_WRITER_PASSWORD')`. The HelmRelease injects the same secret
+# into the *scheduler* container under the different name `CLICKHOUSE_PASSWORD`. §10.3
+# does not touch either name -- it points this pod's env var, spelled the way
+# `profiles.yml` already expects it, at the same underlying Secret key
+# (`clickhouse-elt-writer` / `password`) the scheduler already reads.
+#
+# 🚩 `on_finish_action="delete_succeeded_pod"`, NOT the chart default of deleting every
+# pod. §10.5's gate explicitly needs to inspect a FAILED pod
+# (`kubectl describe pod`, `kubectl logs`) before deciding what went wrong. A pod that
+# succeeded is deleted as usual; one that failed is left for inspection until removed by
+# hand.
+OPERATOR_ARGS = {
+    "image": DBT_RUNNER_IMAGE,
+    # 🚩 REQUIRED. The dbt-runner image's ENTRYPOINT is already `dbt`
+    # (dbt-runner/Dockerfile:62). Without this, Cosmos 1.15.1 preserves the default
+    # (unset `cmds`) and the pod runs `dbt dbt run ...` -- see the block comment above.
+    "cmds": ["dbt"],
+    "image_pull_policy": "IfNotPresent",
+    "namespace": "elt",
+    "in_cluster": True,
+    "get_logs": True,
+    "on_finish_action": "delete_succeeded_pod",
+    "env_vars": [
+        k8s.V1EnvVar(
+            name="CLICKHOUSE_HOST",
+            value_from=k8s.V1EnvVarSource(
+                config_map_key_ref=k8s.V1ConfigMapKeySelector(name="clickhouse-conn", key="host")
+            ),
+        ),
+        k8s.V1EnvVar(name="CLICKHOUSE_PORT", value="8123"),
+        k8s.V1EnvVar(name="CLICKHOUSE_USER", value="elt_writer"),
+        k8s.V1EnvVar(name="CLICKHOUSE_DATABASE", value="elt"),
+        k8s.V1EnvVar(
+            name="CLICKHOUSE_ELT_WRITER_PASSWORD",
+            value_from=k8s.V1EnvVarSource(
+                secret_key_ref=k8s.V1SecretKeySelector(name="clickhouse-elt-writer", key="password")
+            ),
+        ),
+    ],
+}
+
 elt_dag = DbtDag(
     dag_id="elt_project",
     # ⚠️ MANUAL TRIGGER ONLY, ON PURPOSE. How often the source data changes decides
@@ -186,4 +254,5 @@ elt_dag = DbtDag(
         execution_mode=EXECUTION_MODE,
         dbt_project_path=DBT_PROJECT_PATH,
     ),
+    operator_args=OPERATOR_ARGS,
 )
