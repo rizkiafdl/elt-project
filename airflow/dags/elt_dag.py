@@ -147,6 +147,11 @@ EXECUTION_MODE = ExecutionMode.KUBERNETES
 #     AFTER_EACH -> 2 tasks   ['stg_placeholder_events.run', 'stg_placeholder_events.test']
 #     AFTER_ALL  -> 2 tasks   ['stg_placeholder_events_run', 'elt_project_test']
 #     NONE       -> 1 task    ['stg_placeholder_events_run']
+# 🕰️ `stg_placeholder_events` WAS DELETED AT §8.4, in the commit that added the first
+# real model. The measurement above is kept as written because it is the record of
+# what was measured; do not go looking for that model. The shape it measured is
+# unchanged -- today AFTER_EACH renders `stg_stock_quote.run` and
+# `stg_stock_quote.test`.
 # Cosmos reports `Total nodes: 6` for all three. Tests do NOT become one task each:
 # AFTER_EACH emits ONE `test` task per model that runs every test on that model in
 # a single dbt invocation.

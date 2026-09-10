@@ -1,26 +1,85 @@
+# Phase 2 §8.4 — the staging layer's contract.
+#
+# ⚠️ BOTH PLACEHOLDER MODELS WERE DELETED IN THE COMMIT THAT ADDED THIS FILE'S
+# `stg_stock_quote` BLOCK, and that was a rule written down long before it was
+# executed (§8.4): "a placeholder that survives into a real project becomes a model
+# someone eventually believes in". The two that went:
+#
+#   * `stg_placeholder_events` -- Phase 1 §6.1, three literal rows, five tests. It
+#     existed so CI had something resolvable to parse before any real model existed.
+#   * `stg_manifest_propagation_probe` -- §9.7, a throwaway second model used to
+#     prove that a change to the manifest reaches the rendered Airflow DAG.
+#
+# Their tests are not lost work: the five schema tests on the placeholder were the
+# proof that the `.test` task in Cosmos runs at all, and the tests below take over
+# that duty on a model that means something.
+
 version: 2
 
 models:
-  - name: stg_placeholder_events
+  - name: stg_stock_quote
     description: >
-      Phase 1 §6.1 placeholder. Three literal rows, no upstream source. Present so the
-      GitHub Actions pipeline has a real model to resolve. ⚠️ It used to be compiled and
-      tested against a DuckDB target; that target was removed on 2026-09-10 and CI now
-      only parses. Replaced by the real staging layer in Phase 2 step 8.
+      One row per (ticker, quoted_at) -- the de-duplicated, renamed view over
+      `landing.stock_quote`. This is the first dbt model in the estate that reads
+      data another system wrote. It asserts a grain the landing table does not
+      have: the §13 loader's duplicate guard only compares within one scheduling
+      window, so a retry in a later window can land the same quote twice.
+
     columns:
-      - name: event_id
-        description: Synthetic surrogate key.
+      - name: ticker
+        description: >
+          Finnhub symbol, e.g. `AAPL`. Only one ticker is loaded today, but every
+          model keys on it so adding a second symbol stays a loader change rather
+          than a rewrite.
         data_tests:
           - not_null
-          - unique
-      - name: event_type
-        description: Placeholder event class.
+
+      - name: quoted_at
+        description: >
+          EVENT TIME -- `api_timestamp` from the source, when Finnhub says the
+          quote was taken. Renamed to make the two clocks tell themselves apart at
+          a glance.
         data_tests:
           - not_null
-          - accepted_values:
-              arguments:
-                values: ["signup", "login", "purchase"]
-      - name: actor
-        description: Placeholder actor handle.
+
+      - name: quote_date
+        description: >
+          `toDate(quoted_at)` -- a **UTC** calendar date, because this ClickHouse
+          runs on `Etc/UTC`. It is not a US market date; a quote taken late in the
+          New York session lands on the next UTC day. Market calendars are business
+          logic and belong in `marts/`.
+        data_tests:
+          - not_null
+
+      - name: current_price
+        description: Finnhub `c` -- the last traded price.
+        data_tests:
+          - not_null
+
+      - name: price_change
+        description: Finnhub `d` -- absolute change against the previous close.
+
+      - name: price_change_pct
+        description: Finnhub `dp` -- percentage change against the previous close.
+
+      - name: high_price
+        description: Finnhub `h` -- the session high.
+
+      - name: low_price
+        description: Finnhub `l` -- the session low.
+
+      - name: open_price
+        description: >
+          Finnhub `o` -- the session open. Renamed off the bare word `open`, which
+          reads as a keyword in enough engines to be worth not arguing about.
+
+      - name: previous_close_price
+        description: Finnhub `pc` -- the previous session's close.
+
+      - name: ingested_at
+        description: >
+          INGESTION TIME -- when ClickHouse wrote the surviving row, carried through
+          unchanged. This is the column source freshness is measured on, and after
+          de-duplication it is the EARLIEST landing of the quote.
         data_tests:
           - not_null
