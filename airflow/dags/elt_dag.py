@@ -163,12 +163,17 @@ TEST_BEHAVIOR = TestBehavior.AFTER_EACH
 # `build_kube_args` (see the module docstring and §10.1's finding, topic 19).
 #
 # 🚩 THIS FILE CARRIES NO PRIVATE ADDRESS AND NO CREDENTIAL. `elt-project` is public.
-# CLICKHOUSE_HOST is sourced from a ConfigMap (`clickhouse-conn`, key `host`) that lives
-# in `homelab-infra` -- the same seam that repository's `flux/airflow/helmrelease.yaml`
+# CLICKHOUSE_HOST is sourced from a ConfigMap (`clickhouse-conn`) that lives in
+# `homelab-infra` -- the same seam that repository's `flux/airflow/helmrelease.yaml`
 # already documents at §13.5 for the Airflow chart's own containers. A dbt-runner pod is
 # NOT one of those containers -- it is a fresh pod the scheduler spawns through the
 # Kubernetes API at run time via `KubernetesPodOperator`, and it inherits none of the
 # chart's env. That gap is what §10.3 exists to close.
+#
+# 🔀 REVISED 2026-09-10 AFTER §10.5's FIRST REAL RUN. Both indirect values were wired as
+# `env_vars` entries carrying a `valueFrom`, which is the obvious reading of the
+# KubernetesPodOperator API and is WRONG under Cosmos -- it drops them without a word.
+# They now travel via `env_from`. See the block on `env_vars` below.
 #
 # PORT, USER and DATABASE are plain, non-sensitive literals (a port number, a username,
 # a schema name) and are written here directly -- only the address and the password are
@@ -178,9 +183,11 @@ TEST_BEHAVIOR = TestBehavior.AFTER_EACH
 # ⚠️ NAME RECONCILED, NOT RENAMED. `dbt/profiles.yml` reads
 # `env_var('CLICKHOUSE_ELT_WRITER_PASSWORD')`. The HelmRelease injects the same secret
 # into the *scheduler* container under the different name `CLICKHOUSE_PASSWORD`. §10.3
-# does not touch either name -- it points this pod's env var, spelled the way
-# `profiles.yml` already expects it, at the same underlying Secret key
-# (`clickhouse-elt-writer` / `password`) the scheduler already reads.
+# does not touch either name. Because `envFrom` names the variable after the SECRET KEY,
+# the reconciliation now lives in the Secret itself: `clickhouse-elt-writer` carries the
+# one value under two keys -- `password` for the HelmRelease's `secretKeyRef`, and
+# `CLICKHOUSE_ELT_WRITER_PASSWORD` for this pod's `envFrom`. One value, three consumer
+# names, each spelled where its consumer expects it.
 #
 # 🚩 `on_finish_action="delete_succeeded_pod"`, NOT the chart default of deleting every
 # pod. §10.5's gate explicitly needs to inspect a FAILED pod
@@ -198,22 +205,54 @@ OPERATOR_ARGS = {
     "in_cluster": True,
     "get_logs": True,
     "on_finish_action": "delete_succeeded_pod",
+    # ── env: LITERALS ONLY. Anything with a `valueFrom` MUST go in `env_from` below.
+    #
+    # 🚩 COSMOS 1.15.1 SILENTLY DISCARDS `valueFrom` FROM `env_vars`. This is not a
+    # style preference; it is a measured defect, and it cost §10.5 a full run to find.
+    # `cosmos/operators/_k8s_common.py::_build_env_vars` flattens whatever the user
+    # passed down to a plain `{name: value}` dict and rebuilds it:
+    #
+    #     for ev in existing_env_vars:
+    #         env_vars_dict[ev.name] = ev.value      # reads ONLY .value
+    #     return convert_env_vars(env_vars_dict)     # rebuilds V1EnvVar(name, value)
+    #
+    # `build_kube_args` then assigns the result back over `operator.env_vars`, so a
+    # `V1EnvVar(name=..., value_from=V1EnvVarSource(...))` reaches the pod as
+    # `{name: ..., value: None, value_from: None}`. Kubernetes renders that as an EMPTY
+    # STRING, dbt's `env_var()` returns "", and the clickhouse adapter falls back to its
+    # own default host — `localhost:8123` — where it fails with `Connection refused`.
+    # NOTHING IN THE LOG SAYS AN ENV VAR WAS DROPPED. The pod looks correctly configured
+    # right up until the connection error names a host nobody configured.
+    # Detail: findings topic 26.
     "env_vars": [
-        k8s.V1EnvVar(
-            name="CLICKHOUSE_HOST",
-            value_from=k8s.V1EnvVarSource(
-                config_map_key_ref=k8s.V1ConfigMapKeySelector(name="clickhouse-conn", key="host")
-            ),
-        ),
         k8s.V1EnvVar(name="CLICKHOUSE_PORT", value="8123"),
         k8s.V1EnvVar(name="CLICKHOUSE_USER", value="elt_writer"),
         k8s.V1EnvVar(name="CLICKHOUSE_DATABASE", value="elt"),
-        k8s.V1EnvVar(
-            name="CLICKHOUSE_ELT_WRITER_PASSWORD",
-            value_from=k8s.V1EnvVarSource(
-                secret_key_ref=k8s.V1SecretKeySelector(name="clickhouse-elt-writer", key="password")
-            ),
-        ),
+    ],
+    # ── env_from: THE ADDRESS AND THE CREDENTIAL, THE ONLY TWO FACTS THIS PUBLIC
+    # REPOSITORY MUST NEVER CARRY.
+    #
+    # ✅ VERIFIED ON THE RUNNING SCHEDULER, not assumed: Cosmos rewrites `env_vars` and
+    # never reads or reassigns `env_from`, so these references survive the flattening
+    # above and land on the container intact. Probe: attach `env_from`, call
+    # `build_kube_args` then `build_pod_request_obj`, and read
+    # `container.env_from` off the V1Pod that would be submitted (findings topic 26 §5).
+    #
+    # ⚠️ `envFrom` HAS NO KEY SELECTOR. It imports EVERY key in the object and USES THE
+    # KEY NAME AS THE ENV VAR NAME. That is why:
+    #   * `clickhouse-conn` (homelab-infra) has its key named `CLICKHOUSE_HOST`, not `host`
+    #   * `clickhouse-elt-writer` carries a key named `CLICKHOUSE_ELT_WRITER_PASSWORD`,
+    #     which is the name `dbt/profiles.yml` already reads. The Secret's original
+    #     `password` key stays for the HelmRelease, which injects it into the CHART's
+    #     containers under the third name `CLICKHOUSE_PASSWORD` (§13.5).
+    # Renaming either key silently reintroduces the `localhost` failure, because a
+    # missing key produces no error here — only a differently-named variable.
+    #
+    # Both objects are namespaced to `elt` and are resolved by the kubelet at pod start,
+    # so this file names them and never their contents.
+    "env_from": [
+        k8s.V1EnvFromSource(config_map_ref=k8s.V1ConfigMapEnvSource(name="clickhouse-conn")),
+        k8s.V1EnvFromSource(secret_ref=k8s.V1SecretEnvSource(name="clickhouse-elt-writer")),
     ],
 }
 
