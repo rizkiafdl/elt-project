@@ -52,7 +52,20 @@ WORKDIR ${DBT_HOME}
 # Resolve dbt_utils at build time from the committed package-lock.yml, so the
 # running pod never needs to reach dbt Hub. A pod that fetches packages at
 # start-up fails whenever the network or the Hub is having a bad day.
-RUN dbt deps --no-version-check
+#
+# `dbt deps` runs here as root -- `USER dbt` is set below, not above. Any dbt
+# invocation initialises the event logger, and the logger CREATES DBT_LOG_PATH
+# (/tmp/dbt-logs) and opens dbt.log inside it. Created by root, that directory is
+# mode 755 root:root. The pod then runs as uid 1000, dbt's setup_event_logger
+# finds the directory already present so it does not recreate it, and
+# RotatingFileHandler fails with `PermissionError: [Errno 13] ... /tmp/dbt-logs/
+# dbt.log` -- dbt aborts before it opens a single database connection
+# (source: secondary/elt-pipeline-plan/phase-2-execution-findings.md topic 25).
+#
+# Delete the build-time log and target directories so the non-root runtime user
+# recreates them itself, owned by uid 1000, on the first `dbt` call in the pod.
+RUN dbt deps --no-version-check \
+ && rm -rf /tmp/dbt-logs /tmp/dbt-target
 
 # Non-root. uid 1000 is a plain choice, not inherited from anything.
 RUN useradd --create-home --uid 1000 dbt \
