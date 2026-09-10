@@ -104,7 +104,7 @@ DBT_PROFILE_NAME = "elt_project"
 # ⚠️ NOT CONSUMED YET. §10.3 is what puts this into `operator_args`; until then the
 # constant is written, verified and committed but nothing reads it. That seam is
 # deliberate: §10.2 owns how the value ARRIVES, §10.3 owns how the pod USES it.
-DBT_RUNNER_IMAGE = "ghcr.io/rizkiafdl/dbt-runner@sha256:d22436bd82db8358ceb60b5c00dc05be942d5c23df61982e280ffb8dfe8dfcd5"  # ci:dbt-runner-digest
+DBT_RUNNER_IMAGE = "ghcr.io/rizkiafdl/dbt-runner@sha256:28d406ec16c609c9ed19521a5308eb95292616dd98ee1fb515805191896ec1c4"  # ci:dbt-runner-digest
 
 # ⚠️ WAS "dev" (DuckDB) UNTIL 2026-09-10. The DuckDB target was removed at Rizki's
 # direction, so "prod" is not a promotion here — it is the only target that exists
