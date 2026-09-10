@@ -109,7 +109,7 @@ DBT_PROFILE_NAME = "elt_project"
 # ⚠️ NOT CONSUMED YET. §10.3 is what puts this into `operator_args`; until then the
 # constant is written, verified and committed but nothing reads it. That seam is
 # deliberate: §10.2 owns how the value ARRIVES, §10.3 owns how the pod USES it.
-DBT_RUNNER_IMAGE = "ghcr.io/rizkiafdl/dbt-runner@sha256:1b5223733abe2bc237e6ad2c6872a06afe99c7a1cddb438b847cdb18bbc88d64"  # ci:dbt-runner-digest
+DBT_RUNNER_IMAGE = "ghcr.io/rizkiafdl/dbt-runner@sha256:2fae76e887620f3ce58a56bef2f1bf1e2fdccfe1fa6bbc61fef752b0f040cc8f"  # ci:dbt-runner-digest
 
 # ⚠️ WAS "dev" (DuckDB) UNTIL 2026-09-10. The DuckDB target was removed at Rizki's
 # direction, so "prod" is not a promotion here — it is the only target that exists
@@ -311,8 +311,8 @@ OPERATOR_ARGS = {
 # substitution did not take. The placeholders are deliberately IMPOSSIBLE values --
 # an all-zero SHA and CI run 0 -- so an un-rewritten DAG compares as older than every
 # real manifest and fails LOUDLY here, rather than quietly running with a stale pin.
-BUILD_SOURCE_SHA = "e3aaff99a676f968a5ca50bba262b33727c4cccf"  # ci:build-source-sha
-BUILD_CI_RUN = 28  # ci:build-ci-run
+BUILD_SOURCE_SHA = "09d15ff3db74627f2b0ad07069168a9580c2c709"  # ci:build-source-sha
+BUILD_CI_RUN = 29  # ci:build-ci-run
 
 # The manifest side of the pair.
 #
